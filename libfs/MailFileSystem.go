@@ -16,15 +16,18 @@ import (
 	"mime/quotedprintable"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 )
 
 const FileBlockSize = 512 * 65536 //32M
 
 type MailFileSystem struct {
-	c         *imapclient.Client
-	remoteDir string
-	db        sql.DB
+	c               *imapclient.Client
+	remoteDir       string
+	downloadRootDir string
+	db              sql.DB
 }
 
 func (mailfs *MailFileSystem) Login(usr string, pwd string) error {
@@ -43,9 +46,9 @@ func (mailfs *MailFileSystem) Login(usr string, pwd string) error {
 	return nil
 }
 
-func (mailfs *MailFileSystem) CacheUID(uid imap.UID) error {
+func (mailfs *MailFileSystem) cacheUID(uid imap.UID) error {
 
-	logrus.Debugf("CacheUID : %v", uid)
+	logrus.Debugf("cacheUID : %v", uid)
 
 	uidSeqSet := imap.UIDSetNum(uid)
 	bodySection := &imap.FetchItemBodySection{Part: []int{1}}
@@ -77,6 +80,11 @@ func (mailfs *MailFileSystem) CacheUID(uid imap.UID) error {
 
 	mailText := MailTextFromByte(string(b))
 
+	if len(mailText.Vsubject) == 0 || len(mailText.Vlocalpath) == 0 {
+		logrus.Warnf("not a mailfs: %v, uid: ", uid)
+		return nil
+	}
+
 	err = cacheToDB(msg.UID, mailText)
 	if err != nil {
 		logrus.Errorf("cacheToDB failed: %v", err)
@@ -105,9 +113,9 @@ func (mailfs *MailFileSystem) CacheCurrDir() error {
 	logrus.Infof("UID has: %v", uids.AllUIDs())
 
 	for _, uid := range uids.AllUIDs() {
-		err := mailfs.CacheUID(uid)
+		err := mailfs.cacheUID(uid)
 		if err != nil {
-			logrus.Errorf("CacheUID failed: %v", err)
+			logrus.Errorf("cacheUID failed: %v", err)
 			return err
 		}
 	}
@@ -127,7 +135,283 @@ func (mailfs *MailFileSystem) Enter(remoteDir string) error {
 	}
 
 	mailfs.remoteDir = remoteDir
-	logrus.Printf("%v contains %v messages", remoteDir, selectedMbox.NumMessages)
+	logrus.Infof("%v contains %v messages", remoteDir, selectedMbox.NumMessages)
+	return nil
+}
+
+func (mailfs *MailFileSystem) SetDownloadRootDir(dir string) error {
+
+	fileInfo, err := os.Stat(dir)
+	if err != nil {
+		logrus.Errorf("SetDownloadRootDir error: %v", err)
+		return err
+	}
+
+	if !fileInfo.IsDir() {
+		logrus.Errorf("not a dir: %v", dir)
+		return errors.New("not a dir")
+	}
+
+	mailfs.downloadRootDir = dir
+	if mailfs.downloadRootDir[len(mailfs.downloadRootDir)-1] != '/' {
+		mailfs.downloadRootDir = mailfs.downloadRootDir + "/"
+	}
+
+	return nil
+}
+
+func (mailfs *MailFileSystem) GetCacheFiles() ([]CacheFile, error) {
+	if mailfs.c == nil {
+		return nil, errors.New("not login")
+	}
+
+	if len(mailfs.remoteDir) <= 0 {
+		return nil, errors.New("not select dir")
+	}
+
+	return getCacheFileFromDB(mailfs.remoteDir)
+}
+
+func (mailfs *MailFileSystem) downloadUID(uid int64) (*MailText, []byte, error) {
+	logrus.Debugf("downloadUID : %v", uid)
+
+	uidSeqSet := imap.UIDSetNum(imap.UID(uid))
+	bodySection := &imap.FetchItemBodySection{}
+	fetchOptions := &imap.FetchOptions{
+		UID:         true,
+		BodySection: []*imap.FetchItemBodySection{bodySection},
+	}
+
+	fetchCmd := mailfs.c.Fetch(uidSeqSet, fetchOptions)
+	defer fetchCmd.Close()
+
+	msg := fetchCmd.Next()
+	if msg == nil {
+		return nil, nil, errors.New("no msg from fetch")
+	}
+
+	var bodyData imapclient.FetchItemDataBodySection
+	ok := false
+
+	for {
+		item := msg.Next()
+		if item == nil {
+			break
+		}
+
+		bodyData, ok = item.(imapclient.FetchItemDataBodySection)
+		if ok {
+			break
+		}
+	}
+
+	if !ok {
+		return nil, nil, errors.New("FETCH command did not return body section")
+	}
+
+	mr, err := mail.CreateReader(bodyData.Literal)
+	if err != nil {
+		logrus.Errorf("failed to create mail reader: %v", err)
+		return nil, nil, err
+	}
+
+	var mailText *MailText
+	var fileData []byte
+
+	for {
+		p, err := mr.NextPart()
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			logrus.Errorf("failed to read message part: %v", err)
+			return nil, nil, err
+		}
+
+		switch p.Header.(type) {
+		case *mail.InlineHeader:
+			b, err := io.ReadAll(p.Body)
+			if err != nil {
+				logrus.Errorf("failed to get inline: %v", err)
+				return nil, nil, err
+			}
+			mailText = MailTextFromByte(string(b))
+		case *mail.AttachmentHeader:
+			fileData, err = io.ReadAll(p.Body)
+			if err != nil {
+				logrus.Errorf("failed to get attachment file: %v", err)
+				return nil, nil, err
+			}
+		}
+	}
+
+	if mailText == nil || fileData == nil {
+		logrus.Errorf("mailText == nil || fileData == nil")
+		return nil, nil, errors.New("parse mail error")
+	}
+
+	if len(mailText.Vsubject) == 0 || len(mailText.Vlocalpath) == 0 {
+		errStr := fmt.Sprintf("not a mailfs: %v, uid: ", uid)
+		logrus.Error(errStr)
+		return nil, nil, errors.New(errStr)
+	}
+
+	return mailText, fileData, nil
+}
+
+func (mailfs *MailFileSystem) DownloadCacheFile(f CacheFile) error {
+	if mailfs.c == nil {
+		return errors.New("not login")
+	}
+
+	var err error
+
+	if mailfs.remoteDir != f.MailFolder {
+		if err = mailfs.Enter(f.MailFolder); err != nil {
+			logrus.Errorf("Enter error: %v", err)
+			return errors.New("can't not enter dir")
+		}
+	}
+
+	if f.Blocks == nil {
+		if f.Blocks, err = getCacheBlockFromDB(f.FileID); err != nil {
+			logrus.Errorf("getCacheBlockFromDB error: %v", err)
+			return errors.New("getCacheBlockFromDB error")
+		}
+	}
+
+	if int64(len(f.Blocks)) != f.BlockCount {
+		errStr := fmt.Sprintf("error, because want block count(%v), but only cache(%v)", len(f.Blocks), f.BlockCount)
+		logrus.Errorf("%v", errStr)
+		return errors.New(errStr)
+	}
+
+	p := strings.Split(f.LocalPath, "/")
+	p[0] = p[0][:1]
+	savePath := strings.Join(p, "/")
+	savePath = mailfs.downloadRootDir + savePath
+	saveTmpPath := savePath + ".tmp"
+
+	_, err = os.Stat(savePath)
+	if err == nil {
+		logrus.Debugf("file exist, %v", savePath)
+		return nil
+	}
+
+	os.Remove(saveTmpPath)
+
+	filename := filepath.Base(savePath)
+	path := filepath.Dir(savePath)
+	fileCachePath := path + "/mailfscache_" + f.FileMD5
+
+	logrus.Infof("%s %s", filename, path)
+
+	if err := os.MkdirAll(fileCachePath, 0755); err != nil {
+		logrus.Errorf("mkdir fail: %v", err)
+		return err
+	}
+
+	for _, block := range f.Blocks {
+		cacheBlockPath := fileCachePath + "/" + strconv.FormatInt(block.BlockSeq, 10)
+
+		_, err := os.Stat(cacheBlockPath)
+		if err == nil {
+			logrus.Debugf("block exist, block seq: %v", block.BlockSeq)
+			continue
+		}
+
+		tmp := cacheBlockPath + ".tmp"
+		os.Remove(tmp)
+
+		mailText, b, err := mailfs.downloadUID(block.UID)
+		if err != nil {
+			return err
+		}
+
+		md5byte := md5.Sum(b)
+		blockmd5 := hex.EncodeToString(md5byte[:])
+		if block.BlockMD5 != blockmd5 {
+			errStr := "block md5 not match"
+			logrus.Errorf(errStr)
+			return err
+		}
+
+		if mailText.Vmailfolder != f.MailFolder {
+			errStr := "mailfolder not match"
+			logrus.Errorf(errStr)
+			return err
+		}
+
+		if mailText.Vlocalpath != f.LocalPath {
+			errStr := "localpath not match"
+			logrus.Errorf(errStr)
+			return err
+		}
+
+		logrus.Infof("uid: %v, blockmd5: %v, filesize: %v", block.UID, mailText.Vblockmd5, len(b))
+
+		tmpbf, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+		if err != nil {
+			logrus.Errorf("OpenFile %v, err: %v", tmp, err)
+			return err
+		}
+
+		tmpbf.Write(b)
+		tmpbf.Close()
+
+		err = os.Rename(tmp, cacheBlockPath)
+		if err != nil {
+			logrus.Errorf("rename error %v -> %v, err: %v", tmp, cacheBlockPath, err)
+			return err
+		}
+	}
+
+	tmpf, err := os.OpenFile(saveTmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		logrus.Errorf("OpenFile %v, err: %v", saveTmpPath, err)
+		return err
+	}
+
+	for _, block := range f.Blocks {
+		cacheBlockPath := fileCachePath + "/" + strconv.FormatInt(block.BlockSeq, 10)
+		cacheBlock, err := os.OpenFile(cacheBlockPath, os.O_RDONLY, 0644)
+		if err != nil {
+			logrus.Errorf("OpenFile %v, err: %v", cacheBlockPath, err)
+			return err
+		}
+
+		blockdata, err := io.ReadAll(cacheBlock)
+		cacheBlock.Close()
+		if err != nil {
+			logrus.Errorf("read file %v error: %v", cacheBlockPath, err)
+			return err
+		}
+
+		_, err = tmpf.Write(blockdata)
+		if err != nil {
+			logrus.Errorf("write file %v error: %v", saveTmpPath, err)
+			return err
+		}
+	}
+
+	tmpf.Close()
+
+	filemd5, _ := md5File(saveTmpPath)
+	if filemd5 != f.FileMD5 {
+		logrus.Errorf("file %v md5 not match, %v wanna(%v) error %v -> %v", saveTmpPath, filemd5, f.FileMD5)
+		return errors.New("file md5 not match")
+	}
+
+	err = os.Rename(saveTmpPath, savePath)
+	if err != nil {
+		logrus.Errorf("rename error %v -> %v, err: %v", saveTmpPath, savePath, err)
+		return err
+	}
+
+	err = os.RemoveAll(fileCachePath)
+	if err != nil {
+		logrus.Warnf("remove dir %v, err: %v", fileCachePath, err)
+	}
+
 	return nil
 }
 
@@ -138,7 +422,6 @@ func (mailfs *MailFileSystem) UploadFileEach(header *mail.Header, text []byte, f
 	if err != nil {
 		return err
 	}
-	defer mw.Close()
 
 	textHeader := mail.InlineHeader{}
 	textHeader.Set("Content-Type", "text/plain; charset=utf-8")
@@ -162,6 +445,8 @@ func (mailfs *MailFileSystem) UploadFileEach(header *mail.Header, text []byte, f
 
 	ap.Write(block)
 	ap.Close()
+
+	mw.Close()
 
 	// ----- IMAP APPEND -----
 	mailData := mailBuf.Bytes()
@@ -330,6 +615,7 @@ func (mailfs *MailFileSystem) GenHeader(fileName string, fBlockSeq int64, fBlock
 
 	header.SetSubject(fmt.Sprintf("%v/%v/%v-%v", fileName, "plain", fBlockSeq, fBlockCount))
 	header.SetDate(time.Now())
+	header.SetContentType("multipart/mixed", nil)
 
 	return &header, nil
 }

@@ -60,7 +60,8 @@ func dbOpen() error {
     												fileid INTEGER,
 													blockseq INTEGER NOT NULL,
 													uid INTEGER NOT NULL,
-													blockmd5 VARCHAR(64) NOT NULL
+													blockmd5 VARCHAR(64) NOT NULL,
+    												UNIQUE(fileid, blockseq)
 												);
 `)
 	if err != nil {
@@ -135,7 +136,7 @@ func cacheToDB(uid imap.UID, m *MailText) error {
 	}
 
 	_, err = db.Exec(`INSERT OR REPLACE INTO cache_blocks (fileid, blockseq, uid, blockmd5) 
-										  VALUES (?,?,?,?);`, m.Vmailfolder, s[0], blockseq, blockcount, int32(uid), m.Vblockmd5)
+										  VALUES (?,?,?,?);`, fileid, blockseq, int32(uid), m.Vblockmd5)
 	if err != nil {
 		logrus.Errorf("sql error: %v", err)
 		return err
@@ -157,4 +158,49 @@ func isFileExisted(remoteDir string, localpath string) (bool, error) {
 	}
 
 	return false, nil
+}
+
+func getCacheFileFromDB(remoteDir string) ([]CacheFile, error) {
+	rows, err := db.Query(`SELECT * FROM cache_files WHERE mailfolder=?;`, remoteDir)
+	if err != nil {
+		logrus.Errorf("sql error: %v", err)
+		return nil, err
+	}
+	defer rows.Close()
+
+	files := make([]CacheFile, 0, 300000)
+
+	for rows.Next() {
+		f := CacheFile{}
+		if err := rows.Scan(&f.FileID, &f.MailFolder, &f.LocalPath, &f.BlockCount, &f.FileMD5); err != nil {
+			logrus.Errorf("rows.Scan error: %v", err)
+			return nil, err
+		}
+
+		files = append(files, f)
+	}
+
+	return files, nil
+}
+
+func getCacheBlockFromDB(fileid int64) ([]CacheBlock, error) {
+	rows, err := db.Query(`SELECT * FROM cache_blocks WHERE fileid=?;`, fileid)
+	if err != nil {
+		logrus.Errorf("sql error: %v", err)
+		return nil, err
+	}
+	defer rows.Close()
+
+	blocks := make([]CacheBlock, 0, 10)
+	for rows.Next() {
+		b := CacheBlock{}
+		if err := rows.Scan(&b.FileID, &b.BlockSeq, &b.UID, &b.BlockMD5); err != nil {
+			logrus.Errorf("rows.Scan error: %v", err)
+			return nil, err
+		}
+
+		blocks = append(blocks, b)
+	}
+
+	return blocks, nil
 }

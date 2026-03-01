@@ -100,6 +100,22 @@ func MailTextFromByte(s string) *MailText {
 	return &o
 }
 
+type CacheBlock struct {
+	FileID   int64
+	BlockSeq int64
+	UID      int64
+	BlockMD5 string
+}
+
+type CacheFile struct {
+	FileID     int64
+	MailFolder string
+	LocalPath  string
+	BlockCount int64
+	FileMD5    string
+	Blocks     []CacheBlock
+}
+
 func md5File(path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
