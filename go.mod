@@ -6,6 +6,7 @@ require (
 	github.com/emersion/go-imap/v2 v2.0.0-beta.8
 	github.com/emersion/go-message v0.18.2
 	github.com/sirupsen/logrus v1.9.4
+	github.com/xeodou/go-sqlcipher v0.0.0-20200727080346-d681773ef093
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 )
 

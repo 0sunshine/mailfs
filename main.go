@@ -63,14 +63,15 @@ func main() {
 	fs.Login(lines[0], lines[1])
 
 	fs.Enter("其他文件夹/测试")
-	err = fs.CacheCurrDir()
-	if err != nil {
-		logrus.Errorf("failed to CacheCurrDir: %v\n", err)
-	}
 
-	//
+	//err = fs.CacheCurrDir()
+	//if err != nil {
+	//	logrus.Errorf("failed to CacheCurrDir: %v\n", err)
+	//}
+
 	//fs.UploadFile("G:/BaiduNetdiskDownload/Vue3实战商城后台管理系统开发/Vue3实战商城后台管理系统开发/20.部署服务器上线/[20.1]--部署前环境搭建【海量资源：vipc9.com】.mp4")
 
+	fs.UploadDir("G:\\BaiduNetdiskDownload\\121 - Nginx入门到实践Nginx中间件")
 	return
 
 	c, err := imapclient.DialTLS("imap.qq.com:993", nil)

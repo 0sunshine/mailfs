@@ -6,32 +6,98 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"reflect"
+	"strconv"
+	"strings"
 	"time"
 )
 
 type MailText struct {
-	filemd5    string
-	blockmd5   string
-	filesize   int64
-	blocksize  int64
-	createtime time.Time
-	owner      string
-	localpath  string
-	mailfolder string
+	Vsubject    string    `mailfs:"subject"`
+	Vfilemd5    string    `mailfs:"filemd5"`
+	Vblockmd5   string    `mailfs:"blockmd5"`
+	Vfilesize   int64     `mailfs:"filesize"`
+	Vblocksize  int64     `mailfs:"blocksize"`
+	Vcreatetime time.Time `mailfs:"createtime"`
+	Vowner      string    `mailfs:"owner"`
+	Vlocalpath  string    `mailfs:"localpath"`
+	Vmailfolder string    `mailfs:"mailfolder"`
 }
 
 func MailTextToByte(mailText *MailText) []byte {
 	s := ""
-	s += fmt.Sprintf("filemd5:%v\n", mailText.filemd5)
-	s += fmt.Sprintf("blockmd5:%v\n", mailText.blockmd5)
-	s += fmt.Sprintf("filesize:%v\n", mailText.filesize)
-	s += fmt.Sprintf("blocksize:%v\n", mailText.blocksize)
-	s += fmt.Sprintf("createtime:%v\n", mailText.createtime.Format("2006-01-02 15:04:05"))
-	s += fmt.Sprintf("owner:%v\n", mailText.owner)
-	s += fmt.Sprintf("localpath:%v\n", mailText.localpath)
-	s += fmt.Sprintf("mailfolder:%v\n", mailText.mailfolder)
+	s += fmt.Sprintf("subject:%v\n", mailText.Vsubject)
+	s += fmt.Sprintf("filemd5:%v\n", mailText.Vfilemd5)
+	s += fmt.Sprintf("blockmd5:%v\n", mailText.Vblockmd5)
+	s += fmt.Sprintf("filesize:%v\n", mailText.Vfilesize)
+	s += fmt.Sprintf("blocksize:%v\n", mailText.Vblocksize)
+	s += fmt.Sprintf("createtime:%v\n", mailText.Vcreatetime.Format(time.RFC3339))
+	s += fmt.Sprintf("owner:%v\n", mailText.Vowner)
+	s += fmt.Sprintf("localpath:%v\n", mailText.Vlocalpath)
+	s += fmt.Sprintf("mailfolder:%v\n", mailText.Vmailfolder)
 
 	return []byte(s)
+}
+
+func MailTextFromByte(s string) *MailText {
+
+	o := MailText{}
+
+	fields := strings.Split(s, "\r\n")
+	mapFields := make(map[string]string)
+
+	for _, each := range fields {
+		if !strings.Contains(each, ":") {
+			continue
+		}
+
+		pos := strings.IndexByte(each, ':')
+		if pos == -1 {
+			continue
+		}
+
+		mapFields[each[0:pos]] = each[pos+1:]
+	}
+
+	v := reflect.ValueOf(&o).Elem()
+
+	for i := 0; i < v.NumField(); i++ {
+		fieldInfo := v.Type().Field(i)
+		tag := fieldInfo.Tag
+		name := tag.Get("mailfs")
+		if name == "" {
+			continue
+		}
+
+		f, ok := mapFields[name]
+		if !ok {
+			continue
+		}
+
+		rv := v.Field(i)
+		if !rv.CanSet() {
+			continue
+		}
+
+		if rv.Type() == reflect.TypeOf(time.Time{}) {
+			t, err := time.Parse(time.RFC3339, f)
+			if err == nil {
+				rv.Set(reflect.ValueOf(t))
+			}
+		}
+
+		switch rv.Kind() {
+		case reflect.String:
+			rv.SetString(f)
+		case reflect.Int64:
+			n, err := strconv.ParseInt(f, 10, 64)
+			if err == nil {
+				rv.SetInt(n)
+			}
+		}
+	}
+
+	return &o
 }
 
 func md5File(path string) (string, error) {

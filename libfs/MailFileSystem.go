@@ -3,6 +3,7 @@ package libfs
 import (
 	"bytes"
 	"crypto/md5"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -11,7 +12,7 @@ import (
 	"github.com/emersion/go-message/mail"
 	"github.com/sirupsen/logrus"
 	"io"
-	"log"
+	"io/fs"
 	"mime/quotedprintable"
 	"os"
 	"path/filepath"
@@ -23,17 +24,18 @@ const FileBlockSize = 512 * 65536 //32M
 type MailFileSystem struct {
 	c         *imapclient.Client
 	remoteDir string
+	db        sql.DB
 }
 
-func (fs *MailFileSystem) Login(usr string, pwd string) error {
+func (mailfs *MailFileSystem) Login(usr string, pwd string) error {
 	var err error = nil
-	fs.c, err = imapclient.DialTLS("imap.qq.com:993", nil)
+	mailfs.c, err = imapclient.DialTLS("imap.qq.com:993", nil)
 	if err != nil {
 		logrus.Fatalf("failed to dial IMAP server: %v", err)
 		return err
 	}
 
-	if err = fs.c.Login(usr, pwd).Wait(); err != nil {
+	if err = mailfs.c.Login(usr, pwd).Wait(); err != nil {
 		logrus.Fatalf("failed to login: %v", err)
 		return err
 	}
@@ -41,7 +43,7 @@ func (fs *MailFileSystem) Login(usr string, pwd string) error {
 	return nil
 }
 
-func (fs *MailFileSystem) CacheUID(uid imap.UID) error {
+func (mailfs *MailFileSystem) CacheUID(uid imap.UID) error {
 
 	logrus.Debugf("CacheUID : %v", uid)
 
@@ -52,7 +54,7 @@ func (fs *MailFileSystem) CacheUID(uid imap.UID) error {
 		BodySection: []*imap.FetchItemBodySection{bodySection},
 	}
 
-	messages, err := fs.c.Fetch(uidSeqSet, fetchOptions).Collect()
+	messages, err := mailfs.c.Fetch(uidSeqSet, fetchOptions).Collect()
 	if err != nil {
 		logrus.Errorf("FETCH command failed: %v", err)
 		return err
@@ -73,33 +75,39 @@ func (fs *MailFileSystem) CacheUID(uid imap.UID) error {
 		return err
 	}
 
-	log.Printf("Header:\n%v", string(b))
+	mailText := MailTextFromByte(string(b))
+
+	err = cacheToDB(msg.UID, mailText)
+	if err != nil {
+		logrus.Errorf("cacheToDB failed: %v", err)
+		return err
+	}
 
 	return nil
 }
 
-func (fs *MailFileSystem) CacheCurrDir() error {
-	if fs.c == nil {
+func (mailfs *MailFileSystem) CacheCurrDir() error {
+	if mailfs.c == nil {
 		return errors.New("not login")
 	}
 
-	if len(fs.remoteDir) <= 0 {
+	if len(mailfs.remoteDir) <= 0 {
 		return errors.New("not select dir")
 	}
 
-	uids, err := fs.c.UIDSearch(&imap.SearchCriteria{
+	uids, err := mailfs.c.UIDSearch(&imap.SearchCriteria{
 		Header: []imap.SearchCriteriaHeaderField{},
 	}, nil).Wait()
 	if err != nil {
-		logrus.Fatalf("UID SEARCH command failed: %v", err)
+		logrus.Errorf("UID SEARCH command failed: %v", err)
 	}
 
 	logrus.Infof("UID has: %v", uids.AllUIDs())
 
 	for _, uid := range uids.AllUIDs() {
-		err := fs.CacheUID(uid)
+		err := mailfs.CacheUID(uid)
 		if err != nil {
-			logrus.Fatalf("CacheUID failed: %v", err)
+			logrus.Errorf("CacheUID failed: %v", err)
 			return err
 		}
 	}
@@ -107,23 +115,23 @@ func (fs *MailFileSystem) CacheCurrDir() error {
 	return nil
 }
 
-func (fs *MailFileSystem) Enter(remoteDir string) error {
-	if fs.c == nil {
+func (mailfs *MailFileSystem) Enter(remoteDir string) error {
+	if mailfs.c == nil {
 		return errors.New("not login")
 	}
 
-	selectedMbox, err := fs.c.Select(remoteDir, nil).Wait()
+	selectedMbox, err := mailfs.c.Select(remoteDir, nil).Wait()
 	if err != nil {
 		logrus.Fatalf("failed to select : %v", remoteDir)
 		return err
 	}
 
-	fs.remoteDir = remoteDir
+	mailfs.remoteDir = remoteDir
 	logrus.Printf("%v contains %v messages", remoteDir, selectedMbox.NumMessages)
 	return nil
 }
 
-func (fs *MailFileSystem) UploadFileEach(header *mail.Header, text []byte, fileName string, block []byte) error {
+func (mailfs *MailFileSystem) UploadFileEach(header *mail.Header, text []byte, fileName string, block []byte) error {
 	// 创建邮件缓冲区
 	var mailBuf bytes.Buffer
 	mw, err := mail.CreateWriter(&mailBuf, *header)
@@ -157,7 +165,7 @@ func (fs *MailFileSystem) UploadFileEach(header *mail.Header, text []byte, fileN
 
 	// ----- IMAP APPEND -----
 	mailData := mailBuf.Bytes()
-	appendCmd := fs.c.Append(fs.remoteDir, int64(len(mailData)), nil)
+	appendCmd := mailfs.c.Append(mailfs.remoteDir, int64(len(mailData)), nil)
 	if _, err := appendCmd.Write(mailData); err != nil {
 		logrus.Errorf("failed to write message: %v", err)
 		return err
@@ -176,21 +184,32 @@ func (fs *MailFileSystem) UploadFileEach(header *mail.Header, text []byte, fileN
 	return nil
 }
 
-func (fs *MailFileSystem) UploadFile(path string) error {
-	if fs.c == nil {
+func (mailfs *MailFileSystem) UploadFile(path string) error {
+	if mailfs.c == nil {
 		return errors.New("not login")
 	}
 
-	if len(fs.remoteDir) <= 0 {
+	if len(mailfs.remoteDir) <= 0 {
 		return errors.New("not select dir")
+	}
+
+	logrus.Infof("remote: %v, upload file: %v", mailfs.remoteDir, path)
+
+	existed, err := isFileExisted(mailfs.remoteDir, path)
+	if err != nil {
+		logrus.Errorf("isFileExisted occur error: %v", path)
+		return err
+	}
+
+	if existed {
+		logrus.Infof("ignore..., remote: %v, file has existed in mail: %v", mailfs.remoteDir, path)
+		return nil
 	}
 
 	filemd5, err := md5File(path)
 	if err != nil {
 		return err
 	}
-
-	logrus.Printf("filemd5: %v", filemd5)
 
 	f, err := os.OpenFile(path, os.O_RDONLY, 0644)
 
@@ -225,23 +244,28 @@ func (fs *MailFileSystem) UploadFile(path string) error {
 		md5byte := md5.Sum(fileBlock)
 		blockmd5 := hex.EncodeToString(md5byte[:])
 
-		mailText := MailText{
-			filemd5:    filemd5,
-			blockmd5:   blockmd5,
-			filesize:   fSize,
-			blocksize:  int64(len(fileBlock)),
-			createtime: time.Now(),
-			owner:      "sunshine",
-			localpath:  path,
-			mailfolder: fs.remoteDir,
-		}
-
-		header, err := fs.GenHeader(fileName, i, fBlockCount)
+		header, err := mailfs.GenHeader(fileName, i, fBlockCount)
 		if err != nil {
 			return err
 		}
 
-		err = fs.UploadFileEach(header, MailTextToByte(&mailText), fileName, fileBlock)
+		mailText := MailText{
+			Vfilemd5:    filemd5,
+			Vblockmd5:   blockmd5,
+			Vfilesize:   fSize,
+			Vblocksize:  int64(len(fileBlock)),
+			Vcreatetime: time.Now(),
+			Vowner:      "sunshine",
+			Vlocalpath:  path,
+			Vmailfolder: mailfs.remoteDir,
+		}
+
+		mailText.Vsubject, err = header.Subject()
+		if err != nil {
+			return err
+		}
+
+		err = mailfs.UploadFileEach(header, MailTextToByte(&mailText), fileName, fileBlock)
 		if err != nil {
 			return err
 		}
@@ -250,7 +274,49 @@ func (fs *MailFileSystem) UploadFile(path string) error {
 	return nil
 }
 
-func (fs *MailFileSystem) GenHeader(fileName string, fBlockSeq int64, fBlockCount int64) (*mail.Header, error) {
+func (mailfs *MailFileSystem) UploadDir(path string) error {
+	fileInfo, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+
+	if !fileInfo.IsDir() {
+		return errors.New("not a dir")
+	}
+
+	err = filepath.WalkDir(path, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if !d.Type().IsRegular() {
+			return nil
+		}
+
+		// 获取绝对路径
+		absPath, err := filepath.Abs(path)
+		if err != nil {
+			logrus.Errorf("get path error: %v", err)
+			return nil
+		}
+
+		err = mailfs.UploadFile(filepath.ToSlash(absPath))
+		if err != nil {
+			logrus.Errorf("UploadFile error: %v", err)
+			return nil
+		}
+
+		return nil
+	})
+
+	if err != err {
+		return err
+	}
+
+	return nil
+}
+
+func (mailfs *MailFileSystem) GenHeader(fileName string, fBlockSeq int64, fBlockCount int64) (*mail.Header, error) {
 	header := mail.Header{}
 	header.SetAddressList("From", []*mail.Address{{
 		Name:    "阳光",
