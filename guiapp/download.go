@@ -138,29 +138,24 @@ func (p *DownloadPage) Content() fyne.CanvasObject {
 			children, ok := p.treeChildren[id]
 			return ok && len(children) > 0
 		},
-		// createNode: 创建节点渲染对象
+		// createNode: 创建支持右键的节点渲染对象
 		func(branch bool) fyne.CanvasObject {
-			icon := widget.NewIcon(theme.FolderIcon())
-			lbl := widget.NewLabel("")
-			lbl.TextStyle = fyne.TextStyle{Monospace: true}
-			lbl.Wrapping = fyne.TextWrapOff
-			return container.NewBorder(nil, nil, icon, nil, lbl)
+			return newTreeNodeCell(p)
 		},
 		// updateNode: 用数据填充节点，只显示当前层级名称（去掉父路径前缀）
 		func(id widget.TreeNodeID, branch bool, obj fyne.CanvasObject) {
-			box := obj.(*fyne.Container)
-			iconW := box.Objects[1].(*widget.Icon)
-			lblW := box.Objects[0].(*widget.Label)
+			cell := obj.(*treeNodeCell)
 			display := id
 			if idx := strings.LastIndex(id, "/"); idx >= 0 {
 				display = id[idx+1:]
 			}
-			lblW.SetText(display)
+			cell.label.SetText(display)
 			if branch {
-				iconW.SetResource(theme.FolderIcon())
+				cell.icon.SetResource(theme.FolderIcon())
 			} else {
-				iconW.SetResource(theme.FolderOpenIcon())
+				cell.icon.SetResource(theme.FolderOpenIcon())
 			}
+			cell.nodeID = id
 		},
 	)
 	p.pathTree.OnSelected = func(id widget.TreeNodeID) {
@@ -420,15 +415,15 @@ func (p *DownloadPage) filterByPath(nodeID string) {
 	p.mu.Unlock()
 
 	var filtered []libfs.CacheFile
-	if nodeID == "" {
-		filtered = all
-	} else {
-		prefix := nodeID + "/"
-		for _, f := range all {
-			lp := normalizePath(f.LocalPath) + "/"
-			if strings.HasPrefix(lp, prefix) {
-				filtered = append(filtered, f)
-			}
+	for _, f := range all {
+		lp := normalizePath(f.LocalPath)
+		// 取文件所在目录（最后一个 "/" 之前的部分）
+		dir := ""
+		if idx := strings.LastIndex(lp, "/"); idx >= 0 {
+			dir = lp[:idx]
+		}
+		if dir == nodeID {
+			filtered = append(filtered, f)
 		}
 	}
 
@@ -665,6 +660,107 @@ func newPopupDialog(title string, content fyne.CanvasObject, win fyne.Window) *w
 	pop.Resize(fyne.NewSize(700, 440))
 	closeBtn.OnTapped = func() { pop.Hide() }
 	return pop
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// treeNodeCell — 路径树节点，支持右键弹出"下载整个文件夹"菜单
+// ─────────────────────────────────────────────────────────────────────────────
+
+type treeNodeCell struct {
+	widget.BaseWidget
+	icon   *widget.Icon
+	label  *widget.Label
+	nodeID string
+	page   *DownloadPage
+}
+
+func newTreeNodeCell(page *DownloadPage) *treeNodeCell {
+	c := &treeNodeCell{
+		icon:  widget.NewIcon(theme.FolderIcon()),
+		label: widget.NewLabel(""),
+		page:  page,
+	}
+	c.label.TextStyle = fyne.TextStyle{Monospace: true}
+	c.label.Wrapping = fyne.TextWrapOff
+	c.ExtendBaseWidget(c)
+	return c
+}
+
+func (c *treeNodeCell) CreateRenderer() fyne.WidgetRenderer {
+	box := container.NewBorder(nil, nil, c.icon, nil, c.label)
+	return widget.NewSimpleRenderer(box)
+}
+
+func (c *treeNodeCell) MouseDown(ev *desktop.MouseEvent) {
+	if ev.Button != desktop.MouseButtonSecondary {
+		return
+	}
+	if c.page.win == nil || c.nodeID == "" {
+		return
+	}
+	nodeID := c.nodeID
+	pos := ev.AbsolutePosition
+	menu := fyne.NewMenu("",
+		fyne.NewMenuItem("⬇  下载该文件夹（递归）", func() {
+			go c.page.downloadFolder(nodeID)
+		}),
+		fyne.NewMenuItemSeparator(),
+		fyne.NewMenuItem("📋  复制路径", func() {
+			c.page.win.Clipboard().SetContent(nodeID)
+			c.page.setStatus("已复制路径: " + nodeID)
+		}),
+	)
+	widget.ShowPopUpMenuAtPosition(menu, c.page.win.Canvas(), pos)
+}
+
+func (c *treeNodeCell) MouseUp(_ *desktop.MouseEvent) {}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// downloadFolder — 递归收集 nodeID 及其所有子目录下的文件并依次下载
+// ─────────────────────────────────────────────────────────────────────────────
+
+func (p *DownloadPage) downloadFolder(nodeID string) {
+	p.mu.Lock()
+	all := p.allFiles
+	p.mu.Unlock()
+
+	// 收集该目录及所有子目录下的文件（前缀匹配，即递归）
+	prefix := nodeID + "/"
+	var targets []libfs.CacheFile
+	for _, f := range all {
+		lp := normalizePath(f.LocalPath)
+		if strings.HasPrefix(lp+"/", prefix) {
+			targets = append(targets, f)
+		}
+	}
+
+	if len(targets) == 0 {
+		p.setStatus(fmt.Sprintf("目录 [%s] 下没有可下载的文件", lastSegment(nodeID)))
+		return
+	}
+
+	dirName := lastSegment(nodeID)
+	p.setStatus(fmt.Sprintf("⬇  开始下载目录 [%s]，共 %d 个文件…", dirName, len(targets)))
+
+	for i, f := range targets {
+		name := lastSegment(f.LocalPath)
+		p.setStatus(fmt.Sprintf("⬇  [%d/%d] 下载中: %s", i+1, len(targets), name))
+		p.showBlockProgress(0, f.BlockCount)
+
+		err := p.fs.DownloadCacheFileWithProgress(f, func(cur, total int64, _ string) {
+			p.showBlockProgress(cur, total)
+			p.setStatus(fmt.Sprintf("⬇  [%d/%d] %s  块 %d/%d", i+1, len(targets), name, cur, total))
+		})
+
+		p.hideBlockProgress()
+		if err != nil {
+			logrus.Errorf("downloadFolder file error: %v", err)
+			p.setStatus(fmt.Sprintf("✗ [%d/%d] 下载失败: %s — %v", i+1, len(targets), name, err))
+			// 继续下载其余文件，不中断
+		}
+	}
+
+	p.setStatus(fmt.Sprintf("✓ 目录 [%s] 下载完成，共 %d 个文件", dirName, len(targets)))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
