@@ -173,8 +173,11 @@ func (p *DownloadPage) Content() fyne.CanvasObject {
 	copyNodeBtn.Importance = widget.LowImportance
 	treeHeader := container.NewBorder(nil, nil, nil, copyNodeBtn, makeHeaderLabel("🌲 文件路径树"))
 	treeScroll := container.NewVScroll(p.pathTree)
-	treeScroll.SetMinSize(fyne.NewSize(0, 100)) // 固定最小高度，防止 refresh 时撑开布局
-	treePanel := container.NewBorder(treeHeader, nil, nil, nil, treeScroll)
+	treeScroll.SetMinSize(fyne.NewSize(0, 100))
+	// 用 fixedWidthContainer 包裹，切断 Tree 内容宽度向上传递的路径，
+	// 防止 Refresh 时 HSplit 左侧宽度被重置或无法拉宽。
+	treeWrapper := newFixedWidthContainer(treeScroll)
+	treePanel := container.NewBorder(treeHeader, nil, nil, nil, treeWrapper)
 
 	// 用 NewBorder 替代 VSplit：文件夹列表固定在顶部，路径树占据剩余空间。
 	// 这样 pathTree.Refresh() 不会导致整体布局的 offset 被重算。
@@ -661,18 +664,52 @@ func newPopupDialog(title string, content fyne.CanvasObject, win fyne.Window) *w
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// fixedWidthContainer — 宽度跟随父容器（由 HSplit 决定），
+// 不受内部 Tree 内容宽度变化影响，从而避免 Refresh 时布局被撑开/收缩。
+//
+// 原理：Fyne 布局时子控件的 MinSize().Width 会向上传递影响父容器。
+// widget.Tree 在 Refresh 后会依据最长节点文字重算 MinSize().Width，
+// 该值一路传递到 HSplit 导致左侧宽度被重置，且 offset 也随之改变。
+// fixedWidthContainer 将宽度截断为 0，切断传播链，
+// HSplit 只按自己记录的 offset 决定左右宽度。
+// ─────────────────────────────────────────────────────────────────────────────
+
+type fixedWidthContainer struct {
+	widget.BaseWidget
+	content fyne.CanvasObject
+}
+
+func newFixedWidthContainer(content fyne.CanvasObject) *fixedWidthContainer {
+	c := &fixedWidthContainer{content: content}
+	c.ExtendBaseWidget(c)
+	return c
+}
+
+func (f *fixedWidthContainer) CreateRenderer() fyne.WidgetRenderer {
+	return widget.NewSimpleRenderer(f.content)
+}
+
+// MinSize 只保留高度，宽度返回 0，
+// 让父容器（HSplit）完全掌控宽度，Tree 内容不会反向影响布局。
+func (f *fixedWidthContainer) MinSize() fyne.Size {
+	min := f.content.MinSize()
+	return fyne.NewSize(0, min.Height)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // fileTableWidget — 真正能响应右键的表格
 //
 // 关键思路：
-//   widget.Table 的每个 cell 是独立的 CanvasObject。
-//   为了捕获右键，我们让 createCell 返回一个实现了
-//   desktop.Mouseable 接口的自定义 widget（tableCell），
-//   这样鼠标按下事件就会在 cell 层面被捕获。
 //
-//   fileTableWidget 本身继承 BaseWidget，成为合法的
-//   fyne.CanvasObject，可以直接放入布局容器。
+//	widget.Table 的每个 cell 是独立的 CanvasObject。
+//	为了捕获右键，我们让 createCell 返回一个实现了
+//	desktop.Mouseable 接口的自定义 widget（tableCell），
+//	这样鼠标按下事件就会在 cell 层面被捕获。
+//
+//	fileTableWidget 本身继承 BaseWidget，成为合法的
+//	fyne.CanvasObject，可以直接放入布局容器。
+//
 // ─────────────────────────────────────────────────────────────────────────────
-
 type fileTableWidget struct {
 	widget.BaseWidget
 	table        *widget.Table
@@ -761,10 +798,6 @@ func (c *tableCell) CreateRenderer() fyne.WidgetRenderer {
 }
 
 // MouseDown 实现 desktop.Mouseable
-// 右键时：若有 cb（行操作回调）先弹复制菜单，再通过 cb 弹下载菜单会覆盖；
-// 改为：把"复制单元格"作为第一个选项直接注入，然后调 cb 触发行菜单替换。
-// 实际最佳：cb 负责弹包含复制的完整菜单，tableCell 只传文字。
-// 此处简化：右键先弹"复制单元格"菜单；行级下载菜单通过左键选中后右键触发 cb。
 func (c *tableCell) MouseDown(ev *desktop.MouseEvent) {
 	if ev.Button != desktop.MouseButtonSecondary {
 		return
@@ -781,14 +814,10 @@ func (c *tableCell) MouseDown(ev *desktop.MouseEvent) {
 			c.win.Clipboard().SetContent(text)
 		}))
 	}
-	// 数据行：追加行级操作（下载等），通过 cb 的菜单项合并进来
-	// 由于 cb 会弹独立菜单，这里改为：有复制项时先弹复制菜单；
-	// 无文字时直接触发 cb 行菜单
 	if c.dataRow >= 0 && c.cb != nil {
 		if len(items) > 0 {
 			items = append(items, fyne.NewMenuItemSeparator())
 		}
-		// 把"下载/复制路径/查看MD5"作为子菜单触发点
 		row := c.dataRow
 		cb := c.cb
 		items = append(items, fyne.NewMenuItem("⬇  下载 / 更多操作…", func() {
@@ -816,9 +845,7 @@ func (c *tableCell) MinSize() fyne.Size {
 // normalizePath 统一路径分隔符，并去除 Windows 盘符前的多余 "/"
 // 例: "/G:/foo/bar" → "G:/foo/bar"，"/home/alice" → "home/alice"
 func normalizePath(lp string) string {
-	// 统一反斜杠为正斜杠
 	lp = strings.ReplaceAll(lp, "\\", "/")
-	// 去除首部所有多余的 / （处理如 /G:/foo 这类路径）
 	lp = strings.TrimLeft(lp, "/")
 	return lp
 }
