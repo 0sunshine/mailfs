@@ -23,10 +23,17 @@ type UploadPage struct {
 	folderList    *widget.List
 	logView       *widget.List
 	statusLabel   *widget.Label
-	progressBar   *widget.ProgressBarInfinite
 	uploadFileBtn *widget.Button
 	uploadDirBtn  *widget.Button
 	targetLabel   *widget.Label
+
+	// 块级进度
+	blockBar   *widget.ProgressBar
+	blockLabel *widget.Label
+
+	// 文件级进度（目录上传专用）
+	fileBar   *widget.ProgressBar
+	fileLabel *widget.Label
 
 	folders   []string
 	selFolder string
@@ -44,20 +51,19 @@ func NewUploadPage(fs *libfs.MailFileSystem) *UploadPage {
 func (p *UploadPage) SetWindow(w fyne.Window) { p.win = w }
 
 func (p *UploadPage) Content() fyne.CanvasObject {
-	// ── 左侧文件夹列表 ──
+	// ── 左侧文件夹列表 ──────────────────────────────
 	p.folderList = widget.NewList(
 		func() int { return len(p.folders) },
 		func() fyne.CanvasObject {
 			return container.NewHBox(
 				widget.NewIcon(theme.FolderIcon()),
-				widget.NewLabel("placeholder"),
+				widget.NewLabel(""),
 			)
 		},
 		func(i widget.ListItemID, obj fyne.CanvasObject) {
 			obj.(*fyne.Container).Objects[1].(*widget.Label).SetText(p.folders[i])
 		},
 	)
-
 	p.folderList.OnSelected = func(id widget.ListItemID) {
 		folder := p.folders[id]
 		p.selFolder = folder
@@ -68,7 +74,7 @@ func (p *UploadPage) Content() fyne.CanvasObject {
 			if err := p.fs.Enter(folder); err != nil {
 				p.setStatus(fmt.Sprintf("进入文件夹失败: %v", err))
 			} else {
-				p.setStatus(fmt.Sprintf("目标: [%s]  已就绪", folder))
+				p.setStatus(fmt.Sprintf("✓ 目标已就绪: [%s]", folder))
 			}
 		}()
 	}
@@ -78,21 +84,15 @@ func (p *UploadPage) Content() fyne.CanvasObject {
 	})
 	refreshBtn.Importance = widget.LowImportance
 
-	leftHeader := container.NewBorder(nil, nil, nil, refreshBtn,
-		makeHeaderLabel("📁  目标文件夹"),
-	)
+	leftHeader := container.NewBorder(nil, nil, nil, refreshBtn, makeHeaderLabel("📁  目标文件夹"))
 	leftPanel := container.NewBorder(leftHeader, nil, nil, nil,
-		container.NewVScroll(p.folderList),
-	)
+		container.NewVScroll(p.folderList))
 
-	// ── 右侧上传控制区 ──
+	// ── 右侧上传控制区 ──────────────────────────────
 	p.targetLabel = widget.NewLabel("(未选择)")
 	p.targetLabel.TextStyle = fyne.TextStyle{Bold: true, Monospace: true}
 
-	targetRow := container.NewHBox(
-		widget.NewLabel("上传至:"),
-		p.targetLabel,
-	)
+	targetRow := container.NewHBox(widget.NewLabel("上传至:"), p.targetLabel)
 
 	p.uploadFileBtn = widget.NewButtonWithIcon("选择文件上传…", theme.FileIcon(), func() {
 		p.pickAndUploadFile()
@@ -106,9 +106,25 @@ func (p *UploadPage) Content() fyne.CanvasObject {
 	p.uploadDirBtn.Importance = widget.MediumImportance
 	p.uploadDirBtn.Disable()
 
-	p.progressBar = widget.NewProgressBarInfinite()
-	p.progressBar.Hide()
+	// ── 块级进度 ────────────────────────────────────
+	p.blockBar = widget.NewProgressBar()
+	p.blockBar.Hide()
+	p.blockLabel = widget.NewLabel("")
+	p.blockLabel.TextStyle = fyne.TextStyle{Monospace: true}
+	p.blockLabel.Hide()
 
+	blockRow := container.NewBorder(nil, nil, p.blockLabel, nil, p.blockBar)
+
+	// ── 文件级进度 ──────────────────────────────────
+	p.fileBar = widget.NewProgressBar()
+	p.fileBar.Hide()
+	p.fileLabel = widget.NewLabel("")
+	p.fileLabel.TextStyle = fyne.TextStyle{Monospace: true}
+	p.fileLabel.Hide()
+
+	fileRow := container.NewBorder(nil, nil, p.fileLabel, nil, p.fileBar)
+
+	// ── 状态标签 ────────────────────────────────────
 	p.statusLabel = widget.NewLabel("请先在左侧选择目标文件夹")
 	p.statusLabel.TextStyle = fyne.TextStyle{Monospace: true}
 
@@ -117,11 +133,13 @@ func (p *UploadPage) Content() fyne.CanvasObject {
 		widget.NewSeparator(),
 		targetRow,
 		container.NewGridWithColumns(2, p.uploadFileBtn, p.uploadDirBtn),
-		p.progressBar,
+		widget.NewSeparator(),
+		blockRow,
+		fileRow,
 		p.statusLabel,
 	)
 
-	// ── 日志区 ──
+	// ── 日志区 ──────────────────────────────────────
 	p.logView = widget.NewList(
 		func() int { return len(p.logs) },
 		func() fyne.CanvasObject {
@@ -131,7 +149,8 @@ func (p *UploadPage) Content() fyne.CanvasObject {
 			return lbl
 		},
 		func(i widget.ListItemID, obj fyne.CanvasObject) {
-			// 倒序：最新日志在上
+			p.mu.Lock()
+			defer p.mu.Unlock()
 			idx := len(p.logs) - 1 - i
 			if idx >= 0 {
 				obj.(*widget.Label).SetText(p.logs[idx])
@@ -147,15 +166,12 @@ func (p *UploadPage) Content() fyne.CanvasObject {
 	})
 	clearBtn.Importance = widget.LowImportance
 
-	logHeader := container.NewBorder(nil, nil, nil, clearBtn,
-		makeHeaderLabel("📋  上传日志"),
-	)
+	logHeader := container.NewBorder(nil, nil, nil, clearBtn, makeHeaderLabel("📋  上传日志"))
 	logBox := container.NewBorder(logHeader, nil, nil, nil,
-		container.NewVScroll(p.logView),
-	)
+		container.NewVScroll(p.logView))
 
 	rightPanel := container.NewVSplit(controlBox, logBox)
-	rightPanel.SetOffset(0.35)
+	rightPanel.SetOffset(0.40)
 
 	split := container.NewHSplit(leftPanel, rightPanel)
 	split.SetOffset(0.22)
@@ -163,6 +179,8 @@ func (p *UploadPage) Content() fyne.CanvasObject {
 	go p.loadFolders()
 	return split
 }
+
+// ─── 文件夹加载 ────────────────────────────────────────────────────────────
 
 func (p *UploadPage) loadFolders() {
 	p.setStatus("正在获取文件夹列表…")
@@ -175,9 +193,11 @@ func (p *UploadPage) loadFolders() {
 	p.mu.Lock()
 	p.folders = folders
 	p.mu.Unlock()
-	p.folderList.Refresh()
+	fyne.Do(func() { p.folderList.Refresh() })
 	p.setStatus(fmt.Sprintf("共 %d 个文件夹，请选择上传目标", len(folders)))
 }
+
+// ─── 选择文件/文件夹并上传 ─────────────────────────────────────────────────
 
 func (p *UploadPage) pickAndUploadFile() {
 	if p.win == nil {
@@ -206,68 +226,149 @@ func (p *UploadPage) pickAndUploadDir() {
 	d.Show()
 }
 
+// ─── 上传执行（带双层进度）────────────────────────────────────────────────
+
 func (p *UploadPage) doUploadFile(path string) {
 	name := filepath.Base(path)
 	p.addLog(fmt.Sprintf("▶ 开始上传: %s", name))
 	p.setStatus(fmt.Sprintf("上传中: %s", name))
-	p.showProgress(true)
-	p.uploadFileBtn.Disable()
-	p.uploadDirBtn.Disable()
+	p.setButtons(false)
 
-	if err := p.fs.UploadFile(path); err != nil {
+	// 显示块进度条
+	p.showBlockProgress(0, 1)
+	p.hideFileProgress()
+
+	err := p.fs.UploadFileWithProgress(path, func(cur, total int64, fn string) {
+		p.showBlockProgress(cur, total)
+		p.setStatus(fmt.Sprintf("⬆  上传中 [%s]  块 %d / %d", name, cur, total))
+	})
+
+	p.hideBlockProgress()
+
+	if err != nil {
 		logrus.Errorf("upload file error: %v", err)
 		p.addLog(fmt.Sprintf("✗ 上传失败: %s — %v", name, err))
-		p.setStatus(fmt.Sprintf("上传失败: %v", err))
+		p.setStatus(fmt.Sprintf("✗ 上传失败: %v", err))
 	} else {
 		p.addLog(fmt.Sprintf("✓ 上传完成: %s", name))
 		p.setStatus(fmt.Sprintf("✓ 上传完成: %s", name))
 	}
-
-	p.uploadFileBtn.Enable()
-	p.uploadDirBtn.Enable()
-	p.showProgress(false)
+	p.setButtons(true)
 }
 
 func (p *UploadPage) doUploadDir(path string) {
-	name := filepath.Base(path)
-	p.addLog(fmt.Sprintf("▶ 开始上传目录: %s/", name))
-	p.setStatus(fmt.Sprintf("上传目录中: %s/…", name))
-	p.showProgress(true)
-	p.uploadFileBtn.Disable()
-	p.uploadDirBtn.Disable()
+	dirName := filepath.Base(path)
+	p.addLog(fmt.Sprintf("▶ 开始上传目录: %s/", dirName))
+	p.setStatus(fmt.Sprintf("上传目录: %s/…", dirName))
+	p.setButtons(false)
 
-	if err := p.fs.UploadDir(path); err != nil {
+	p.showBlockProgress(0, 1)
+	p.showFileProgress(0, 1)
+
+	currentFile := ""
+	err := p.fs.UploadDirWithProgress(
+		path,
+		// 文件级回调
+		func(done, total int, fp string) {
+			currentFile = filepath.Base(fp)
+			if fp == "" {
+				currentFile = "(完成)"
+			}
+			p.showFileProgress(int64(done), int64(total))
+			p.setStatus(fmt.Sprintf("⬆  文件 %d/%d  %s", done, total, currentFile))
+		},
+		// 块级回调
+		func(cur, total int64, fn string) {
+			p.showBlockProgress(cur, total)
+			p.addLog(fmt.Sprintf("  块 %d/%d  %s", cur, total, filepath.Base(fn)))
+		},
+	)
+
+	p.hideBlockProgress()
+	p.hideFileProgress()
+
+	if err != nil {
 		logrus.Errorf("upload dir error: %v", err)
 		p.addLog(fmt.Sprintf("✗ 目录上传失败: %v", err))
-		p.setStatus(fmt.Sprintf("目录上传失败: %v", err))
+		p.setStatus(fmt.Sprintf("✗ 目录上传失败: %v", err))
 	} else {
-		p.addLog(fmt.Sprintf("✓ 目录上传完成: %s/", name))
-		p.setStatus(fmt.Sprintf("✓ 目录上传完成: %s/", name))
+		p.addLog(fmt.Sprintf("✓ 目录上传完成: %s/", dirName))
+		p.setStatus(fmt.Sprintf("✓ 目录上传完成: %s/", dirName))
 	}
-
-	p.uploadFileBtn.Enable()
-	p.uploadDirBtn.Enable()
-	p.showProgress(false)
+	p.setButtons(true)
 }
+
+// ─── 进度条 helpers ────────────────────────────────────────────────────────
+
+func (p *UploadPage) showBlockProgress(cur, total int64) {
+	if total <= 0 {
+		total = 1
+	}
+	v := float64(cur) / float64(total)
+	fyne.Do(func() {
+		p.blockBar.Show()
+		p.blockLabel.Show()
+		p.blockBar.SetValue(v)
+		p.blockLabel.SetText(fmt.Sprintf("块 %d/%d", cur, total))
+	})
+}
+
+func (p *UploadPage) hideBlockProgress() {
+	fyne.Do(func() {
+		p.blockBar.SetValue(0)
+		p.blockBar.Hide()
+		p.blockLabel.Hide()
+	})
+}
+
+func (p *UploadPage) showFileProgress(cur, total int64) {
+	if total <= 0 {
+		total = 1
+	}
+	v := float64(cur) / float64(total)
+	fyne.Do(func() {
+		p.fileBar.Show()
+		p.fileLabel.Show()
+		p.fileBar.SetValue(v)
+		p.fileLabel.SetText(fmt.Sprintf("文件 %d/%d", cur, total))
+	})
+}
+
+func (p *UploadPage) hideFileProgress() {
+	fyne.Do(func() {
+		p.fileBar.SetValue(0)
+		p.fileBar.Hide()
+		p.fileLabel.Hide()
+	})
+}
+
+// ─── 日志 / 状态 ──────────────────────────────────────────────────────────
 
 func (p *UploadPage) addLog(msg string) {
 	p.mu.Lock()
 	p.logs = append(p.logs, msg)
+	n := len(p.logs)
 	p.mu.Unlock()
-	p.logView.Refresh()
-	if len(p.logs) > 0 {
-		p.logView.ScrollTo(0)
-	}
+	fyne.Do(func() {
+		p.logView.Refresh()
+		if n > 0 {
+			p.logView.ScrollTo(0)
+		}
+	})
 }
 
-func (p *UploadPage) setStatus(msg string) { p.statusLabel.SetText(msg) }
+func (p *UploadPage) setStatus(msg string) {
+	fyne.Do(func() { p.statusLabel.SetText(msg) })
+}
 
-func (p *UploadPage) showProgress(show bool) {
-	if show {
-		p.progressBar.Show()
-		p.progressBar.Start()
-	} else {
-		p.progressBar.Stop()
-		p.progressBar.Hide()
-	}
+func (p *UploadPage) setButtons(enabled bool) {
+	fyne.Do(func() {
+		if enabled {
+			p.uploadFileBtn.Enable()
+			p.uploadDirBtn.Enable()
+		} else {
+			p.uploadFileBtn.Disable()
+			p.uploadDirBtn.Disable()
+		}
+	})
 }

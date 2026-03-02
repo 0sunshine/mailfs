@@ -24,6 +24,8 @@ func main() {
 		os.Exit(1)
 	}
 
+	fs.SetDownloadRootDir("D:/")
+
 	a := app.New()
 	a.Settings().SetTheme(&MailfsTheme{})
 
