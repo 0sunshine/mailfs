@@ -1,22 +1,21 @@
 package guiapp
 
 import (
-	"mailfs/libfs"
-
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+	"mailfs/libfs"
 )
 
 // NewMainWindow 创建主窗口
-func NewMainWindow(a fyne.App, fs *libfs.MailFileSystem) fyne.Window {
+func NewMainWindow(a fyne.App) fyne.Window {
 	w := a.NewWindow("MailFS  —  邮件文件系统")
 	w.Resize(fyne.NewSize(1200, 720))
 	w.SetMaster()
 
-	download := NewDownloadPage(fs)
-	upload := NewUploadPage(fs)
+	download := NewDownloadPage(libfs.NewMailFileSystem())
+	upload := NewUploadPage(libfs.NewMailFileSystem())
 
 	// 注入窗口引用（用于文件对话框和右键菜单）
 	download.SetWindow(w)

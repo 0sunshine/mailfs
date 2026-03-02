@@ -30,20 +30,59 @@ type MailFileSystem struct {
 	db              sql.DB
 }
 
+func readPasswd(path string) ([]string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	lines := strings.Split(string(b), "\n")
+	if len(lines) < 2 {
+		return nil, fmt.Errorf("passwd.txt 格式错误")
+	}
+	lines[0] = strings.TrimRight(lines[0], "\r\n")
+	lines[1] = strings.TrimRight(lines[1], "\r\n")
+	return lines, nil
+}
+
+func NewMailFileSystem() *MailFileSystem {
+	fs := MailFileSystem{}
+
+	lines, err := readPasswd("passwd.txt")
+	if err != nil {
+		logrus.Errorf("read passwd.txt error: %v\n", err)
+		os.Exit(1)
+	}
+
+	if err := fs.Login(lines[0], lines[1]); err != nil {
+		logrus.Errorf("login error: %v\n", err)
+	}
+
+	fs.SetDownloadRootDir("D:/")
+	return &fs
+}
+
 func (mailfs *MailFileSystem) Login(usr string, pwd string) error {
 	var err error = nil
 	mailfs.c, err = imapclient.DialTLS("imap.qq.com:993", nil)
 	if err != nil {
-		logrus.Fatalf("failed to dial IMAP server: %v", err)
+		logrus.Errorf("failed to dial IMAP server: %v", err)
 		return err
 	}
 
 	if err = mailfs.c.Login(usr, pwd).Wait(); err != nil {
-		logrus.Fatalf("failed to login: %v", err)
+		logrus.Errorf("failed to login: %v", err)
 		return err
 	}
 
 	return nil
+}
+
+func (mailfs *MailFileSystem) Logout() {
+	if mailfs.c == nil {
+		return
+	}
+	mailfs.c.Logout()
+	mailfs.c = nil
 }
 
 func (mailfs *MailFileSystem) cacheUID(uid imap.UID) error {

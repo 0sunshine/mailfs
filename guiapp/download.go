@@ -518,7 +518,10 @@ func (p *DownloadPage) downloadFile(f libfs.CacheFile) {
 	p.setStatus(fmt.Sprintf("⬇  准备下载: %s", name))
 	p.showBlockProgress(0, f.BlockCount)
 
-	err := p.fs.DownloadCacheFileWithProgress(f, func(cur, total int64, _ string) {
+	fs := libfs.NewMailFileSystem()
+	defer fs.Logout()
+
+	err := fs.DownloadCacheFileWithProgress(f, func(cur, total int64, _ string) {
 		p.showBlockProgress(cur, total)
 		p.setStatus(fmt.Sprintf("⬇  下载中 [%s]  块 %d/%d", name, cur, total))
 	})
@@ -751,12 +754,15 @@ func (p *DownloadPage) downloadFolder(nodeID string) {
 	dirName := lastSegment(nodeID)
 	p.setStatus(fmt.Sprintf("⬇  开始下载目录 [%s]，共 %d 个文件…", dirName, len(targets)))
 
+	fs := libfs.NewMailFileSystem()
+	defer fs.Logout()
+
 	for i, f := range targets {
 		name := lastSegment(f.LocalPath)
 		p.setStatus(fmt.Sprintf("⬇  [%d/%d] 下载中: %s", i+1, len(targets), name))
 		p.showBlockProgress(0, f.BlockCount)
 
-		err := p.fs.DownloadCacheFileWithProgress(f, func(cur, total int64, _ string) {
+		err := fs.DownloadCacheFileWithProgress(f, func(cur, total int64, _ string) {
 			p.showBlockProgress(cur, total)
 			p.setStatus(fmt.Sprintf("⬇  [%d/%d] %s  块 %d/%d", i+1, len(targets), name, cur, total))
 		})
