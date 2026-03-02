@@ -692,6 +692,15 @@ func (c *treeNodeCell) CreateRenderer() fyne.WidgetRenderer {
 }
 
 func (c *treeNodeCell) MouseDown(ev *desktop.MouseEvent) {
+	if ev.Button == desktop.MouseButtonPrimary {
+		// 左键：触发选中过滤（OnSelected 被 Mouseable 拦截后不再自动触发）
+		if c.nodeID != "" {
+			c.page.lastSelNode = c.nodeID
+			c.page.pathTree.Select(c.nodeID)
+			c.page.filterByPath(c.nodeID)
+		}
+		return
+	}
 	if ev.Button != desktop.MouseButtonSecondary {
 		return
 	}
