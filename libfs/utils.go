@@ -116,6 +116,19 @@ type CacheFile struct {
 	Blocks     []CacheBlock
 }
 
+func blockContains(f *CacheFile, seq int64) bool {
+	if f == nil || f.Blocks == nil {
+		return false
+	}
+
+	for _, v := range f.Blocks {
+		if v.BlockSeq == seq {
+			return true
+		}
+	}
+	return false
+}
+
 func md5File(path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -130,4 +143,37 @@ func md5File(path string) (string, error) {
 
 	// 计算 MD5 并转换为十六进制字符串
 	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+type sqlCondition struct {
+	key   string
+	value interface{}
+	op    string // 可选，支持操作符
+}
+
+func sqlBuildQuery(table string, conditions []sqlCondition) (string, []interface{}) {
+	var sb strings.Builder
+	sb.WriteString("SELECT * FROM ")
+
+	sb.WriteString(table)
+
+	if len(conditions) > 0 {
+		sb.WriteString(" WHERE")
+	}
+
+	args := make([]interface{}, 0, len(conditions))
+
+	for _, c := range conditions {
+		if c.op == "" {
+			c.op = "="
+		}
+		sb.WriteString(fmt.Sprintf(" %s %s ? AND", c.key, c.op))
+		args = append(args, c.value)
+	}
+
+	if len(conditions) > 0 {
+		sb.WriteString(" 1=1;")
+	}
+
+	return sb.String(), args
 }

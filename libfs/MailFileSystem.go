@@ -12,7 +12,6 @@ import (
 	"github.com/emersion/go-message/mail"
 	"github.com/sirupsen/logrus"
 	"io"
-	"io/fs"
 	"mime/quotedprintable"
 	"os"
 	"path/filepath"
@@ -218,7 +217,7 @@ func (mailfs *MailFileSystem) GetCacheFiles() ([]CacheFile, error) {
 		return nil, errors.New("not select dir")
 	}
 
-	return getCacheFileFromDB(mailfs.remoteDir)
+	return getCacheFileFromDB(mailfs.remoteDir, "")
 }
 
 func (mailfs *MailFileSystem) downloadUID(uid int64) (*MailText, []byte, error) {
@@ -514,138 +513,6 @@ func (mailfs *MailFileSystem) UploadFileEach(header *mail.Header, text []byte, f
 	}
 
 	logrus.Printf("邮件上传成功: %v", appendData.UID)
-
-	return nil
-}
-
-func (mailfs *MailFileSystem) UploadFile(path string) error {
-	if mailfs.c == nil {
-		return errors.New("not login")
-	}
-
-	if len(mailfs.remoteDir) <= 0 {
-		return errors.New("not select dir")
-	}
-
-	logrus.Infof("remote: %v, upload file: %v", mailfs.remoteDir, path)
-
-	existed, err := isFileExisted(mailfs.remoteDir, path)
-	if err != nil {
-		logrus.Errorf("isFileExisted occur error: %v", path)
-		return err
-	}
-
-	if existed {
-		logrus.Infof("ignore..., remote: %v, file has existed in mail: %v", mailfs.remoteDir, path)
-		return nil
-	}
-
-	filemd5, err := md5File(path)
-	if err != nil {
-		return err
-	}
-
-	f, err := os.OpenFile(path, os.O_RDONLY, 0644)
-
-	if err != nil {
-		return err
-	}
-
-	fInfo, err := f.Stat()
-	if err != nil {
-		return err
-	}
-
-	var fSize int64 = fInfo.Size()
-	var fBlockCount int64 = fSize / FileBlockSize
-	if fSize%FileBlockSize != 0 {
-		fBlockCount++
-	}
-
-	fileName := filepath.Base(path)
-
-	fileBlock := make([]byte, FileBlockSize)
-	for i := int64(1); i <= fBlockCount; i++ {
-		n, err := f.Read(fileBlock)
-		if err != nil {
-			return err
-		}
-
-		if n < FileBlockSize {
-			fileBlock = fileBlock[:n]
-		}
-
-		md5byte := md5.Sum(fileBlock)
-		blockmd5 := hex.EncodeToString(md5byte[:])
-
-		header, err := mailfs.GenHeader(fileName, i, fBlockCount)
-		if err != nil {
-			return err
-		}
-
-		mailText := MailText{
-			Vfilemd5:    filemd5,
-			Vblockmd5:   blockmd5,
-			Vfilesize:   fSize,
-			Vblocksize:  int64(len(fileBlock)),
-			Vcreatetime: time.Now(),
-			Vowner:      "sunshine",
-			Vlocalpath:  path,
-			Vmailfolder: mailfs.remoteDir,
-		}
-
-		mailText.Vsubject, err = header.Subject()
-		if err != nil {
-			return err
-		}
-
-		err = mailfs.UploadFileEach(header, MailTextToByte(&mailText), fileName, fileBlock)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (mailfs *MailFileSystem) UploadDir(path string) error {
-	fileInfo, err := os.Stat(path)
-	if err != nil {
-		return err
-	}
-
-	if !fileInfo.IsDir() {
-		return errors.New("not a dir")
-	}
-
-	err = filepath.WalkDir(path, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-
-		if !d.Type().IsRegular() {
-			return nil
-		}
-
-		// 获取绝对路径
-		absPath, err := filepath.Abs(path)
-		if err != nil {
-			logrus.Errorf("get path error: %v", err)
-			return nil
-		}
-
-		err = mailfs.UploadFile(filepath.ToSlash(absPath))
-		if err != nil {
-			logrus.Errorf("UploadFile error: %v", err)
-			return nil
-		}
-
-		return nil
-	})
-
-	if err != err {
-		return err
-	}
 
 	return nil
 }

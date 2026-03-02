@@ -40,11 +40,22 @@ func (mailfs *MailFileSystem) UploadFileWithProgress(path string, blockCb BlockP
 
 	logrus.Infof("remote: %v, upload file: %v", mailfs.remoteDir, path)
 
-	existed, err := isFileExisted(mailfs.remoteDir, path)
+	cacheFiles, err := getCacheFileFromDB(mailfs.remoteDir, path)
 	if err != nil {
 		return err
 	}
-	if existed {
+
+	var cacheFile *CacheFile = nil
+	if len(cacheFiles) > 0 {
+		cacheFile = &cacheFiles[0]
+
+		cacheFile.Blocks, err = getCacheBlockFromDB(cacheFile.FileID)
+		if err != nil {
+			return err
+		}
+	}
+
+	if cacheFile != nil && cacheFile.BlockCount == int64(len(cacheFile.Blocks)) {
 		logrus.Infof("ignore..., file has existed: %v", path)
 		if blockCb != nil {
 			blockCb(1, 1, filepath.Base(path)) // 已存在视为完成
@@ -78,6 +89,18 @@ func (mailfs *MailFileSystem) UploadFileWithProgress(path string, blockCb BlockP
 	fileBlock := make([]byte, FileBlockSize)
 
 	for i := int64(1); i <= fBlockCount; i++ {
+		blockExisted := blockContains(cacheFile, i)
+		if blockExisted {
+			logrus.Infof("ignore..., block has existed: %v", i)
+
+			_, err = f.Seek(FileBlockSize, io.SeekCurrent)
+			if err != nil {
+				return err
+			}
+
+			continue
+		}
+
 		n, err := f.Read(fileBlock)
 		if err != nil {
 			return err
@@ -324,7 +347,7 @@ type IntegrityResult struct {
 }
 
 func CheckIntegrity(folder string) ([]IntegrityResult, error) {
-	files, err := getCacheFileFromDB(folder)
+	files, err := getCacheFileFromDB(folder, "")
 	if err != nil {
 		return nil, err
 	}

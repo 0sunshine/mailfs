@@ -145,30 +145,31 @@ func cacheToDB(uid imap.UID, m *MailText) error {
 	return nil
 }
 
-func isFileExisted(remoteDir string, localpath string) (bool, error) {
-	rows, err := db.Query(`SELECT fileid FROM cache_files WHERE mailfolder=? AND localpath=?;`, remoteDir, localpath)
-	if err != nil {
-		logrus.Errorf("sql error: %v", err)
-		return false, err
-	}
-	defer rows.Close()
+func getCacheFileFromDB(remoteDir string, localPath string) ([]CacheFile, error) {
 
-	if rows.Next() {
-		return true, nil
+	conds := []sqlCondition{
+		{"mailfolder", remoteDir, "="},
 	}
 
-	return false, nil
-}
+	expectFileNums := 300000
 
-func getCacheFileFromDB(remoteDir string) ([]CacheFile, error) {
-	rows, err := db.Query(`SELECT * FROM cache_files WHERE mailfolder=?;`, remoteDir)
+	if len(localPath) > 0 {
+		conds = append(conds,
+			sqlCondition{"localpath", localPath, "="},
+		)
+
+		expectFileNums = 1
+	}
+
+	query, args := sqlBuildQuery("cache_files", conds)
+	rows, err := db.Query(query, args...)
 	if err != nil {
 		logrus.Errorf("sql error: %v", err)
 		return nil, err
 	}
 	defer rows.Close()
 
-	files := make([]CacheFile, 0, 300000)
+	files := make([]CacheFile, 0, expectFileNums)
 
 	for rows.Next() {
 		f := CacheFile{}
