@@ -89,6 +89,16 @@ func (mailfs *MailFileSystem) cacheUID(uid imap.UID) error {
 
 	logrus.Debugf("cacheUID : %v", uid)
 
+	existed, err := isUIDCached(mailfs.remoteDir, int64(uid))
+	if err != nil {
+		return err
+	}
+
+	if existed {
+		logrus.Debugf("cacheUID : %v has been cached, ignore ...", uid)
+		return nil
+	}
+
 	uidSeqSet := imap.UIDSetNum(uid)
 	bodySection := &imap.FetchItemBodySection{Part: []int{1}}
 	fetchOptions := &imap.FetchOptions{

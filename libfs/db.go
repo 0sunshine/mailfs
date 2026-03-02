@@ -204,3 +204,19 @@ func getCacheBlockFromDB(fileid int64) ([]CacheBlock, error) {
 
 	return blocks, nil
 }
+
+func isUIDCached(remoteDir string, uid int64) (bool, error) {
+	rows, err := db.Query(`SELECT * FROM cache_blocks a INNER JOIN cache_files b 
+         ON a.fileid=b.fileid WHERE a.uid=? and b.mailfolder=?;`, uid, remoteDir)
+	if err != nil {
+		logrus.Errorf("sql error: %v", err)
+		return false, err
+	}
+	defer rows.Close()
+
+	if rows.Next() {
+		return true, nil
+	}
+
+	return false, nil
+}
