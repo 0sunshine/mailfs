@@ -146,12 +146,16 @@ func (p *DownloadPage) Content() fyne.CanvasObject {
 			lbl.Wrapping = fyne.TextWrapOff
 			return container.NewBorder(nil, nil, icon, nil, lbl)
 		},
-		// updateNode: 用数据填充节点
+		// updateNode: 用数据填充节点，只显示当前层级名称（去掉父路径前缀）
 		func(id widget.TreeNodeID, branch bool, obj fyne.CanvasObject) {
 			box := obj.(*fyne.Container)
 			iconW := box.Objects[1].(*widget.Icon)
 			lblW := box.Objects[0].(*widget.Label)
-			lblW.SetText(id)
+			display := id
+			if idx := strings.LastIndex(id, "/"); idx >= 0 {
+				display = id[idx+1:]
+			}
+			lblW.SetText(display)
 			if branch {
 				iconW.SetResource(theme.FolderIcon())
 			} else {
