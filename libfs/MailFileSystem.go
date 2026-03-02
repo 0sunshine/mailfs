@@ -619,3 +619,18 @@ func (mailfs *MailFileSystem) GenHeader(fileName string, fBlockSeq int64, fBlock
 
 	return &header, nil
 }
+
+func (mailfs *MailFileSystem) GetMailboxList() ([]string, error) {
+	listCmd := mailfs.c.List("", "其他文件夹/*", nil)
+	mboxes, err := listCmd.Collect()
+	if err != nil {
+		logrus.Errorf("IMAP LIST failed: %v", err)
+		return nil, err
+	}
+
+	folders := make([]string, 0, len(mboxes))
+	for _, mb := range mboxes {
+		folders = append(folders, mb.Mailbox)
+	}
+	return folders, nil
+}
