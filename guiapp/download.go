@@ -327,14 +327,70 @@ func (p *DownloadPage) syncCache() {
 		p.setStatus("请先选择文件夹")
 		return
 	}
+
 	fyne.Do(func() { p.syncBtn.Disable() })
 	p.setStatus(fmt.Sprintf("正在同步 [%s]…", p.selFolder))
-	if err := p.fs.CacheCurrDir(); err != nil {
+
+	// ── 创建模态进度对话框 ──────────────────────────
+	progressBar := widget.NewProgressBar()
+	progressLabel := widget.NewLabel("正在获取邮件列表…")
+	progressLabel.TextStyle = fyne.TextStyle{Monospace: true}
+	progressLabel.Alignment = fyne.TextAlignCenter
+
+	titleLabel := widget.NewLabelWithStyle(
+		fmt.Sprintf("同步缓存 — [%s]", p.selFolder),
+		fyne.TextAlignLeading,
+		fyne.TextStyle{Bold: true},
+	)
+	line := canvas.NewLine(theme.PrimaryColor())
+	line.StrokeWidth = 1.5
+
+	content := container.NewVBox(
+		titleLabel,
+		line,
+		widget.NewSeparator(),
+		progressLabel,
+		progressBar,
+	)
+
+	var pop *widget.PopUp
+	fyne.Do(func() {
+		pop = widget.NewModalPopUp(
+			container.NewPadded(content),
+			p.win.Canvas(),
+		)
+		pop.Resize(fyne.NewSize(460, 180))
+		pop.Show()
+	})
+
+	// ── 执行同步，通过回调更新对话框 ────────────────
+	err := p.fs.CacheCurrDirWithProgress(func(done, total int) {
+		if total <= 0 {
+			return
+		}
+		v := float64(done) / float64(total)
+		fyne.Do(func() {
+			progressBar.SetValue(v)
+			if done < total {
+				progressLabel.SetText(fmt.Sprintf("正在同步  %d / %d", done, total))
+			} else {
+				progressLabel.SetText(fmt.Sprintf("同步完成  %d / %d", done, total))
+			}
+		})
+	})
+
+	// ── 同步结束，关闭对话框 ────────────────────────
+	fyne.Do(func() {
+		pop.Hide()
+	})
+
+	if err != nil {
 		p.setStatus(fmt.Sprintf("同步失败: %v", err))
 	} else {
 		p.setStatus("同步完成，正在刷新…")
 		p.selectFolder(p.selFolder)
 	}
+
 	fyne.Do(func() { p.syncBtn.Enable() })
 }
 

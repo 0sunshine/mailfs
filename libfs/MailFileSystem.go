@@ -109,33 +109,33 @@ func (mailfs *MailFileSystem) cacheUID(uid imap.UID) error {
 	var msgUID imap.UID
 
 	err = mailfs.withRetry("cacheUID/FETCH", func() error {
-	uidSeqSet := imap.UIDSetNum(uid)
-	bodySection := &imap.FetchItemBodySection{Part: []int{1}}
-	fetchOptions := &imap.FetchOptions{
-		UID:         true,
-		BodySection: []*imap.FetchItemBodySection{bodySection},
-	}
+		uidSeqSet := imap.UIDSetNum(uid)
+		bodySection := &imap.FetchItemBodySection{Part: []int{1}}
+		fetchOptions := &imap.FetchOptions{
+			UID:         true,
+			BodySection: []*imap.FetchItemBodySection{bodySection},
+		}
 
-	messages, err := mailfs.c.Fetch(uidSeqSet, fetchOptions).Collect()
-	if err != nil {
-		logrus.Errorf("FETCH command failed: %v", err)
-		return err
-	}
+		messages, err := mailfs.c.Fetch(uidSeqSet, fetchOptions).Collect()
+		if err != nil {
+			logrus.Errorf("FETCH command failed: %v", err)
+			return err
+		}
 
-	if len(messages) <= 0 {
-		logrus.Errorf("len(messages) <= 0")
-		return errors.New("len(messages) <= 0")
-	}
+		if len(messages) <= 0 {
+			logrus.Errorf("len(messages) <= 0")
+			return errors.New("len(messages) <= 0")
+		}
 
-	msg := messages[0]
-	header := msg.FindBodySection(bodySection)
+		msg := messages[0]
+		header := msg.FindBodySection(bodySection)
 
-	r := quotedprintable.NewReader(bytes.NewReader(header))
-	b, err := io.ReadAll(r)
-	if err != nil {
-		logrus.Errorf("io.ReadAll failed: %v", err)
-		return err
-	}
+		r := quotedprintable.NewReader(bytes.NewReader(header))
+		b, err := io.ReadAll(r)
+		if err != nil {
+			logrus.Errorf("io.ReadAll failed: %v", err)
+			return err
+		}
 
 		mailText = MailTextFromByte(string(b))
 		msgUID = msg.UID
@@ -160,6 +160,13 @@ func (mailfs *MailFileSystem) cacheUID(uid imap.UID) error {
 }
 
 func (mailfs *MailFileSystem) CacheCurrDir() error {
+	return mailfs.CacheCurrDirWithProgress(nil)
+}
+
+// CacheProgressFunc 同步缓存进度回调: (已完成UID数, 总UID数)
+type CacheProgressFunc func(done, total int)
+
+func (mailfs *MailFileSystem) CacheCurrDirWithProgress(progressCb CacheProgressFunc) error {
 	if mailfs.c == nil {
 		return errors.New("not login")
 	}
@@ -187,12 +194,21 @@ func (mailfs *MailFileSystem) CacheCurrDir() error {
 
 	logrus.Infof("UID has: %v", allUIDs)
 
-	for _, uid := range allUIDs {
+	total := len(allUIDs)
+	for i, uid := range allUIDs {
+		if progressCb != nil {
+			progressCb(i, total)
+		}
 		err := mailfs.cacheUID(uid)
 		if err != nil {
 			logrus.Errorf("cacheUID failed: %v", err)
 			return err
 		}
+	}
+
+	// 同步完成，回调最终状态
+	if progressCb != nil {
+		progressCb(total, total)
 	}
 
 	return nil
@@ -270,19 +286,19 @@ func (mailfs *MailFileSystem) downloadUID(uid int64) (*MailText, []byte, error) 
 			return errors.New("no msg from fetch")
 		}
 
-	var bodyData imapclient.FetchItemDataBodySection
-	ok := false
+		var bodyData imapclient.FetchItemDataBodySection
+		ok := false
 
-	for {
-		item := msg.Next()
-		if item == nil {
-			break
-		}
+		for {
+			item := msg.Next()
+			if item == nil {
+				break
+			}
 
-		bodyData, ok = item.(imapclient.FetchItemDataBodySection)
-		if ok {
-			break
-		}
+			bodyData, ok = item.(imapclient.FetchItemDataBodySection)
+			if ok {
+				break
+			}
 		}
 
 		if !ok {
@@ -501,53 +517,53 @@ func (mailfs *MailFileSystem) DownloadCacheFile(f CacheFile) error {
 func (mailfs *MailFileSystem) UploadFileEach(header *mail.Header, text []byte, fileName string, block []byte) error {
 	// 网络操作：APPEND，用 withRetry 包裹
 	return mailfs.withRetry("UploadFileEach/APPEND", func() error {
-	// 创建邮件缓冲区
-	var mailBuf bytes.Buffer
-	mw, err := mail.CreateWriter(&mailBuf, *header)
-	if err != nil {
-		return err
-	}
+		// 创建邮件缓冲区
+		var mailBuf bytes.Buffer
+		mw, err := mail.CreateWriter(&mailBuf, *header)
+		if err != nil {
+			return err
+		}
 
-	textHeader := mail.InlineHeader{}
-	textHeader.Set("Content-Type", "text/plain; charset=utf-8")
-	textWriter, err := mw.CreateSingleInline(textHeader)
-	if err != nil {
-		return err
-	}
+		textHeader := mail.InlineHeader{}
+		textHeader.Set("Content-Type", "text/plain; charset=utf-8")
+		textWriter, err := mw.CreateSingleInline(textHeader)
+		if err != nil {
+			return err
+		}
 
-	textWriter.Write(text)
+		textWriter.Write(text)
 		textWriter.Close()
 
-	attachHeader := mail.AttachmentHeader{}
-	attachHeader.Set("Content-Type", "text/plain")
-	attachHeader.SetFilename(fileName)
-	ap, err := mw.CreateAttachment(attachHeader)
-	if err != nil {
-		return err
-	}
+		attachHeader := mail.AttachmentHeader{}
+		attachHeader.Set("Content-Type", "text/plain")
+		attachHeader.SetFilename(fileName)
+		ap, err := mw.CreateAttachment(attachHeader)
+		if err != nil {
+			return err
+		}
 
-	ap.Write(block)
-	ap.Close()
+		ap.Write(block)
+		ap.Close()
 
-	mw.Close()
+		mw.Close()
 
-	// ----- IMAP APPEND -----
-	mailData := mailBuf.Bytes()
-	appendCmd := mailfs.c.Append(mailfs.remoteDir, int64(len(mailData)), nil)
-	if _, err := appendCmd.Write(mailData); err != nil {
-		logrus.Errorf("failed to write message: %v", err)
-		return err
-	}
-	if err := appendCmd.Close(); err != nil {
-		logrus.Errorf("failed to close message: %v", err)
-	}
+		// ----- IMAP APPEND -----
+		mailData := mailBuf.Bytes()
+		appendCmd := mailfs.c.Append(mailfs.remoteDir, int64(len(mailData)), nil)
+		if _, err := appendCmd.Write(mailData); err != nil {
+			logrus.Errorf("failed to write message: %v", err)
+			return err
+		}
+		if err := appendCmd.Close(); err != nil {
+			logrus.Errorf("failed to close message: %v", err)
+		}
 
-	appendData, err := appendCmd.Wait()
-	if err != nil {
-		return err
-	}
+		appendData, err := appendCmd.Wait()
+		if err != nil {
+			return err
+		}
 
-	logrus.Printf("邮件上传成功: %v", appendData.UID)
+		logrus.Printf("邮件上传成功: %v", appendData.UID)
 		return nil
 	})
 }
