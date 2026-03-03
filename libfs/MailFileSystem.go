@@ -3,7 +3,6 @@ package libfs
 import (
 	"bytes"
 	"crypto/md5"
-	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -26,7 +25,10 @@ type MailFileSystem struct {
 	c               *imapclient.Client
 	remoteDir       string
 	downloadRootDir string
-	db              sql.DB
+
+	// 保存登录凭据，用于网络错误后自动重连
+	usr string
+	pwd string
 }
 
 func readPasswd(path string) ([]string, error) {
@@ -73,6 +75,10 @@ func (mailfs *MailFileSystem) Login(usr string, pwd string) error {
 		return err
 	}
 
+	// 保存凭据用于自动重连
+	mailfs.usr = usr
+	mailfs.pwd = pwd
+
 	return nil
 }
 
@@ -80,7 +86,7 @@ func (mailfs *MailFileSystem) Logout() {
 	if mailfs.c == nil {
 		return
 	}
-	mailfs.c.Logout()
+	_ = mailfs.c.Logout()
 	mailfs.c = nil
 }
 
@@ -98,6 +104,11 @@ func (mailfs *MailFileSystem) cacheUID(uid imap.UID) error {
 		return nil
 	}
 
+	// 网络操作：FETCH，用 withRetry 包裹
+	var mailText *MailText
+	var msgUID imap.UID
+
+	err = mailfs.withRetry("cacheUID/FETCH", func() error {
 	uidSeqSet := imap.UIDSetNum(uid)
 	bodySection := &imap.FetchItemBodySection{Part: []int{1}}
 	fetchOptions := &imap.FetchOptions{
@@ -126,14 +137,20 @@ func (mailfs *MailFileSystem) cacheUID(uid imap.UID) error {
 		return err
 	}
 
-	mailText := MailTextFromByte(string(b))
+		mailText = MailTextFromByte(string(b))
+		msgUID = msg.UID
+		return nil
+	})
+	if err != nil {
+		return err
+	}
 
 	if len(mailText.Vsubject) == 0 || len(mailText.Vlocalpath) == 0 {
 		logrus.Warnf("not a mailfs: %v, uid: ", uid)
 		return nil
 	}
 
-	err = cacheToDB(msg.UID, mailText)
+	err = cacheToDB(msgUID, mailText)
 	if err != nil {
 		logrus.Errorf("cacheToDB failed: %v", err)
 		return err
@@ -151,16 +168,26 @@ func (mailfs *MailFileSystem) CacheCurrDir() error {
 		return errors.New("not select dir")
 	}
 
-	uids, err := mailfs.c.UIDSearch(&imap.SearchCriteria{
-		Header: []imap.SearchCriteriaHeaderField{},
-	}, nil).Wait()
+	// 网络操作：UID SEARCH，用 withRetry 包裹
+	var allUIDs []imap.UID
+	err := mailfs.withRetry("CacheCurrDir/SEARCH", func() error {
+		uids, err := mailfs.c.UIDSearch(&imap.SearchCriteria{
+			Header: []imap.SearchCriteriaHeaderField{},
+		}, nil).Wait()
+		if err != nil {
+			logrus.Errorf("UID SEARCH command failed: %v", err)
+			return err
+		}
+		allUIDs = uids.AllUIDs()
+		return nil
+	})
 	if err != nil {
-		logrus.Errorf("UID SEARCH command failed: %v", err)
+		return err
 	}
 
-	logrus.Infof("UID has: %v", uids.AllUIDs())
+	logrus.Infof("UID has: %v", allUIDs)
 
-	for _, uid := range uids.AllUIDs() {
+	for _, uid := range allUIDs {
 		err := mailfs.cacheUID(uid)
 		if err != nil {
 			logrus.Errorf("cacheUID failed: %v", err)
@@ -223,20 +250,25 @@ func (mailfs *MailFileSystem) GetCacheFiles() ([]CacheFile, error) {
 func (mailfs *MailFileSystem) downloadUID(uid int64) (*MailText, []byte, error) {
 	logrus.Debugf("downloadUID : %v", uid)
 
-	uidSeqSet := imap.UIDSetNum(imap.UID(uid))
-	bodySection := &imap.FetchItemBodySection{}
-	fetchOptions := &imap.FetchOptions{
-		UID:         true,
-		BodySection: []*imap.FetchItemBodySection{bodySection},
-	}
+	var mailText *MailText
+	var fileData []byte
 
-	fetchCmd := mailfs.c.Fetch(uidSeqSet, fetchOptions)
-	defer fetchCmd.Close()
+	// 网络操作：FETCH，用 withRetry 包裹
+	err := mailfs.withRetry("downloadUID/FETCH", func() error {
+		uidSeqSet := imap.UIDSetNum(imap.UID(uid))
+		bodySection := &imap.FetchItemBodySection{}
+		fetchOptions := &imap.FetchOptions{
+			UID:         true,
+			BodySection: []*imap.FetchItemBodySection{bodySection},
+		}
 
-	msg := fetchCmd.Next()
-	if msg == nil {
-		return nil, nil, errors.New("no msg from fetch")
-	}
+		fetchCmd := mailfs.c.Fetch(uidSeqSet, fetchOptions)
+		defer fetchCmd.Close()
+
+		msg := fetchCmd.Next()
+		if msg == nil {
+			return errors.New("no msg from fetch")
+		}
 
 	var bodyData imapclient.FetchItemDataBodySection
 	ok := false
@@ -251,59 +283,62 @@ func (mailfs *MailFileSystem) downloadUID(uid int64) (*MailText, []byte, error) 
 		if ok {
 			break
 		}
-	}
-
-	if !ok {
-		return nil, nil, errors.New("FETCH command did not return body section")
-	}
-
-	mr, err := mail.CreateReader(bodyData.Literal)
-	if err != nil {
-		logrus.Errorf("failed to create mail reader: %v", err)
-		return nil, nil, err
-	}
-
-	var mailText *MailText
-	var fileData []byte
-
-	for {
-		p, err := mr.NextPart()
-		if err == io.EOF {
-			break
-		} else if err != nil {
-			logrus.Errorf("failed to read message part: %v", err)
-			return nil, nil, err
 		}
 
-		switch p.Header.(type) {
-		case *mail.InlineHeader:
-			b, err := io.ReadAll(p.Body)
-			if err != nil {
-				logrus.Errorf("failed to get inline: %v", err)
-				return nil, nil, err
+		if !ok {
+			return errors.New("FETCH command did not return body section")
+		}
+
+		mr, err := mail.CreateReader(bodyData.Literal)
+		if err != nil {
+			logrus.Errorf("failed to create mail reader: %v", err)
+			return err
+		}
+
+		mailText = nil
+		fileData = nil
+
+		for {
+			p, err := mr.NextPart()
+			if err == io.EOF {
+				break
+			} else if err != nil {
+				logrus.Errorf("failed to read message part: %v", err)
+				return err
 			}
-			mailText = MailTextFromByte(string(b))
-		case *mail.AttachmentHeader:
-			fileData, err = io.ReadAll(p.Body)
-			if err != nil {
-				logrus.Errorf("failed to get attachment file: %v", err)
-				return nil, nil, err
+
+			switch p.Header.(type) {
+			case *mail.InlineHeader:
+				b, err := io.ReadAll(p.Body)
+				if err != nil {
+					logrus.Errorf("failed to get inline: %v", err)
+					return err
+				}
+				mailText = MailTextFromByte(string(b))
+			case *mail.AttachmentHeader:
+				fileData, err = io.ReadAll(p.Body)
+				if err != nil {
+					logrus.Errorf("failed to get attachment file: %v", err)
+					return err
+				}
 			}
 		}
-	}
 
-	if mailText == nil || fileData == nil {
-		logrus.Errorf("mailText == nil || fileData == nil")
-		return nil, nil, errors.New("parse mail error")
-	}
+		if mailText == nil || fileData == nil {
+			logrus.Errorf("mailText == nil || fileData == nil")
+			return errors.New("parse mail error")
+		}
 
-	if len(mailText.Vsubject) == 0 || len(mailText.Vlocalpath) == 0 {
-		errStr := fmt.Sprintf("not a mailfs: %v, uid: ", uid)
-		logrus.Error(errStr)
-		return nil, nil, errors.New(errStr)
-	}
+		if len(mailText.Vsubject) == 0 || len(mailText.Vlocalpath) == 0 {
+			errStr := fmt.Sprintf("not a mailfs: %v, uid: ", uid)
+			logrus.Error(errStr)
+			return errors.New(errStr)
+		}
 
-	return mailText, fileData, nil
+		return nil
+	})
+
+	return mailText, fileData, err
 }
 
 func (mailfs *MailFileSystem) DownloadCacheFile(f CacheFile) error {
@@ -464,6 +499,8 @@ func (mailfs *MailFileSystem) DownloadCacheFile(f CacheFile) error {
 }
 
 func (mailfs *MailFileSystem) UploadFileEach(header *mail.Header, text []byte, fileName string, block []byte) error {
+	// 网络操作：APPEND，用 withRetry 包裹
+	return mailfs.withRetry("UploadFileEach/APPEND", func() error {
 	// 创建邮件缓冲区
 	var mailBuf bytes.Buffer
 	mw, err := mail.CreateWriter(&mailBuf, *header)
@@ -479,10 +516,8 @@ func (mailfs *MailFileSystem) UploadFileEach(header *mail.Header, text []byte, f
 	}
 
 	textWriter.Write(text)
-	textWriter.Close()
+		textWriter.Close()
 
-	// 5. 添加附件（可选）
-	// 如果不需要附件，可以省略此部分
 	attachHeader := mail.AttachmentHeader{}
 	attachHeader.Set("Content-Type", "text/plain")
 	attachHeader.SetFilename(fileName)
@@ -513,8 +548,8 @@ func (mailfs *MailFileSystem) UploadFileEach(header *mail.Header, text []byte, f
 	}
 
 	logrus.Printf("邮件上传成功: %v", appendData.UID)
-
-	return nil
+		return nil
+	})
 }
 
 func (mailfs *MailFileSystem) GenHeader(fileName string, fBlockSeq int64, fBlockCount int64) (*mail.Header, error) {
@@ -537,16 +572,23 @@ func (mailfs *MailFileSystem) GenHeader(fileName string, fBlockSeq int64, fBlock
 }
 
 func (mailfs *MailFileSystem) GetMailboxList() ([]string, error) {
-	listCmd := mailfs.c.List("", "其他文件夹/*", nil)
-	mboxes, err := listCmd.Collect()
-	if err != nil {
-		logrus.Errorf("IMAP LIST failed: %v", err)
-		return nil, err
-	}
+	var folders []string
 
-	folders := make([]string, 0, len(mboxes))
-	for _, mb := range mboxes {
-		folders = append(folders, mb.Mailbox)
-	}
-	return folders, nil
+	// 网络操作：LIST，用 withRetry 包裹
+	err := mailfs.withRetry("GetMailboxList/LIST", func() error {
+		listCmd := mailfs.c.List("", "其他文件夹/*", nil)
+		mboxes, err := listCmd.Collect()
+		if err != nil {
+			logrus.Errorf("IMAP LIST failed: %v", err)
+			return err
+		}
+
+		folders = make([]string, 0, len(mboxes))
+		for _, mb := range mboxes {
+			folders = append(folders, mb.Mailbox)
+		}
+		return nil
+	})
+
+	return folders, err
 }

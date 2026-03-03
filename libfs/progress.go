@@ -132,6 +132,7 @@ func (mailfs *MailFileSystem) UploadFileWithProgress(path string, blockCb BlockP
 			return err
 		}
 
+		// UploadFileEach 内部已包含 withRetry
 		if err = mailfs.UploadFileEach(header, MailTextToByte(&mailText), fileName, fileBlock); err != nil {
 			return err
 		}
@@ -262,6 +263,7 @@ func (mailfs *MailFileSystem) DownloadCacheFileWithProgress(f CacheFile, blockCb
 		tmp := cacheBlockPath + ".tmp"
 		os.Remove(tmp)
 
+		// downloadUID 内部已包含 withRetry
 		mailText, b, err := mailfs.downloadUID(block.UID)
 		if err != nil {
 			return err
