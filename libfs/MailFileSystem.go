@@ -90,33 +90,29 @@ func (mailfs *MailFileSystem) Logout() {
 	mailfs.c = nil
 }
 
-func (mailfs *MailFileSystem) cacheUID(uid imap.UID) error {
+func (mailfs *MailFileSystem) cacheUID(uids []imap.UID) error {
 
-	logrus.Debugf("cacheUID : %v", uid)
-
-	existed, err := isUIDCached(mailfs.remoteDir, int64(uid))
-	if err != nil {
-		return err
-	}
-
-	if existed {
-		logrus.Debugf("cacheUID : %v has been cached, ignore ...", uid)
-		return nil
-	}
+	logrus.Debugf("cacheUID : %v", uids)
 
 	// 网络操作：FETCH，用 withRetry 包裹
 	var mailText *MailText
 	var msgUID imap.UID
+	var messages []*imapclient.FetchMessageBuffer
+	bodySection := &imap.FetchItemBodySection{Part: []int{1}}
 
-	err = mailfs.withRetry("cacheUID/FETCH", func() error {
-		uidSeqSet := imap.UIDSetNum(uid)
-		bodySection := &imap.FetchItemBodySection{Part: []int{1}}
+	err := mailfs.withRetry("cacheUID/FETCH", func() error {
+		uidSeqSet := imap.UIDSetNum(uids...)
+
 		fetchOptions := &imap.FetchOptions{
 			UID:         true,
 			BodySection: []*imap.FetchItemBodySection{bodySection},
 		}
 
-		messages, err := mailfs.c.Fetch(uidSeqSet, fetchOptions).Collect()
+		var err error
+
+		logrus.Debugf("FETCH begin...")
+
+		messages, err = mailfs.c.Fetch(uidSeqSet, fetchOptions).Collect()
 		if err != nil {
 			logrus.Errorf("FETCH command failed: %v", err)
 			return err
@@ -127,9 +123,17 @@ func (mailfs *MailFileSystem) cacheUID(uid imap.UID) error {
 			return errors.New("len(messages) <= 0")
 		}
 
-		msg := messages[0]
-		header := msg.FindBodySection(bodySection)
+		logrus.Debugf("FETCH end...")
 
+		return nil
+	})
+
+	if err != nil {
+		return err
+	}
+
+	for _, msg := range messages {
+		header := msg.FindBodySection(bodySection)
 		r := quotedprintable.NewReader(bytes.NewReader(header))
 		b, err := io.ReadAll(r)
 		if err != nil {
@@ -139,21 +143,17 @@ func (mailfs *MailFileSystem) cacheUID(uid imap.UID) error {
 
 		mailText = MailTextFromByte(string(b))
 		msgUID = msg.UID
-		return nil
-	})
-	if err != nil {
-		return err
-	}
 
-	if len(mailText.Vsubject) == 0 || len(mailText.Vlocalpath) == 0 {
-		logrus.Warnf("not a mailfs: %v, uid: ", uid)
-		return nil
-	}
+		if len(mailText.Vsubject) == 0 || len(mailText.Vlocalpath) == 0 {
+			logrus.Warnf("not a mailfs: %v, uid: ", msgUID)
+			return nil
+		}
 
-	err = cacheToDB(msgUID, mailText)
-	if err != nil {
-		logrus.Errorf("cacheToDB failed: %v", err)
-		return err
+		err = cacheToDB(msgUID, mailText)
+		if err != nil {
+			logrus.Errorf("cacheToDB failed: %v", err)
+			return err
+		}
 	}
 
 	return nil
@@ -195,20 +195,38 @@ func (mailfs *MailFileSystem) CacheCurrDirWithProgress(progressCb CacheProgressF
 	logrus.Infof("UID has: %v", allUIDs)
 
 	total := len(allUIDs)
+	progressCb(1, total)
+
+	const UidsCount = 32
+
+	uids := make([]imap.UID, 0, UidsCount)
+
 	for i, uid := range allUIDs {
-		if progressCb != nil {
-			progressCb(i, total)
-		}
-		err := mailfs.cacheUID(uid)
+
+		existed, err := isUIDCached(mailfs.remoteDir, int64(uid))
 		if err != nil {
-			logrus.Errorf("cacheUID failed: %v", err)
 			return err
 		}
-	}
 
-	// 同步完成，回调最终状态
-	if progressCb != nil {
-		progressCb(total, total)
+		if existed {
+			logrus.Debugf("cacheUID : %v has been cached, ignore ...", uid)
+			continue
+		}
+
+		uids = append(uids, uid)
+		if len(uids) >= UidsCount || i == (total-1) {
+			err = mailfs.cacheUID(uids)
+			if err != nil {
+				logrus.Errorf("cacheUID failed: %v", err)
+				return err
+			}
+
+			uids = make([]imap.UID, 0, UidsCount)
+
+			if progressCb != nil {
+				progressCb(i, total)
+			}
+		}
 	}
 
 	return nil
