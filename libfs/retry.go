@@ -19,17 +19,13 @@ func isNetworkError(err error) bool {
 	keywords := []string{
 		"connection reset",
 		"broken pipe",
-		"EOF",
 		"timeout",
 		"timed out",
 		"connection refused",
 		"network is unreachable",
-		"no such host",
 		"i/o timeout",
 		"use of closed network connection",
 		"connection abort",
-		"server closed",
-		"not login",
 		"dial tcp",
 	}
 	for _, kw := range keywords {
