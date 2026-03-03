@@ -27,14 +27,24 @@ func NewMainWindow(a fyne.App) fyne.Window {
 	)
 	tabs.SetTabLocation(container.TabLocationTop)
 
-	// 底部状态栏
-	ver := widget.NewLabelWithStyle("MailFS v1.0  |  QQ IMAP",
+	// ── 右上角关闭按钮 ───────────────────────────────
+	closeBtn := widget.NewButtonWithIcon("", theme.WindowCloseIcon(), func() {
+		w.Close()
+	})
+	closeBtn.Importance = widget.DangerImportance
+
+	// ── 底部版本信息 ─────────────────────────────────
+	ver := widget.NewLabelWithStyle(
+		"MailFS v1.0  |  QQ IMAP",
 		fyne.TextAlignTrailing,
 		fyne.TextStyle{Monospace: true},
 	)
 	ver.Importance = widget.LowImportance
 
-	root := container.NewBorder(nil, ver, nil, nil, tabs)
+	// tabs 占中央，关闭按钮钉在右上角，版本信息在底部
+	topBar := container.NewBorder(nil, nil, nil, closeBtn)
+	root := container.NewBorder(topBar, ver, nil, nil, tabs)
+
 	w.SetContent(root)
 	return w
 }
