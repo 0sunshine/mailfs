@@ -639,5 +639,13 @@ func (mailfs *MailFileSystem) GetMailboxList() ([]string, error) {
 		return nil
 	})
 
-	return folders, err
+	if err != nil {
+		return folders, err
+	}
+
+	// 根据 folders.txt 配置文件过滤目录列表
+	allowed := LoadAllowedFolders()
+	folders = FilterFolders(folders, allowed)
+
+	return folders, nil
 }
