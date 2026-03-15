@@ -75,7 +75,6 @@ func (mailfs *MailFileSystem) Login(usr string, pwd string) error {
 		return err
 	}
 
-	// 保存凭据用于自动重连
 	mailfs.usr = usr
 	mailfs.pwd = pwd
 
@@ -94,7 +93,6 @@ func (mailfs *MailFileSystem) cacheUID(uids []imap.UID) error {
 
 	logrus.Debugf("cacheUID : %v", uids)
 
-	// 网络操作：FETCH，用 withRetry 包裹
 	var mailText *MailText
 	var msgUID imap.UID
 	var messages []*imapclient.FetchMessageBuffer
@@ -144,6 +142,13 @@ func (mailfs *MailFileSystem) cacheUID(uids []imap.UID) error {
 		mailText = MailTextFromByte(string(b))
 		msgUID = msg.UID
 
+		// 如果是加密邮件，解密 localpath 和 subject
+		// 数据库中存储解密后的真实路径
+		if IsEncryptedSubject(mailText.Vsubject) {
+			mailText.Vlocalpath = Decrypt(mailText.Vlocalpath)
+			mailText.Vsubject = DecryptSubject(mailText.Vsubject)
+		}
+
 		if len(mailText.Vsubject) == 0 || len(mailText.Vlocalpath) == 0 {
 			logrus.Warnf("not a mailfs: %v, uid: ", msgUID)
 			return nil
@@ -175,7 +180,6 @@ func (mailfs *MailFileSystem) CacheCurrDirWithProgress(progressCb CacheProgressF
 		return errors.New("not select dir")
 	}
 
-	// 网络操作：UID SEARCH，用 withRetry 包裹
 	var allUIDs []imap.UID
 	err := mailfs.withRetry("CacheCurrDir/SEARCH", func() error {
 		uids, err := mailfs.c.UIDSearch(&imap.SearchCriteria{
@@ -287,7 +291,6 @@ func (mailfs *MailFileSystem) downloadUID(uid int64) (*MailText, []byte, error) 
 	var mailText *MailText
 	var fileData []byte
 
-	// 网络操作：FETCH，用 withRetry 包裹
 	err := mailfs.withRetry("downloadUID/FETCH", func() error {
 		uidSeqSet := imap.UIDSetNum(imap.UID(uid))
 		bodySection := &imap.FetchItemBodySection{}
@@ -371,6 +374,12 @@ func (mailfs *MailFileSystem) downloadUID(uid int64) (*MailText, []byte, error) 
 
 		return nil
 	})
+
+	// 下载时如果是加密邮件，解密路径信息
+	if err == nil && mailText != nil && IsEncryptedSubject(mailText.Vsubject) {
+		mailText.Vlocalpath = Decrypt(mailText.Vlocalpath)
+		mailText.Vsubject = DecryptSubject(mailText.Vsubject)
+	}
 
 	return mailText, fileData, err
 }
@@ -533,9 +542,7 @@ func (mailfs *MailFileSystem) DownloadCacheFile(f CacheFile) error {
 }
 
 func (mailfs *MailFileSystem) UploadFileEach(header *mail.Header, text []byte, fileName string, block []byte) error {
-	// 网络操作：APPEND，用 withRetry 包裹
 	return mailfs.withRetry("UploadFileEach/APPEND", func() error {
-		// 创建邮件缓冲区
 		var mailBuf bytes.Buffer
 		mw, err := mail.CreateWriter(&mailBuf, *header)
 		if err != nil {
@@ -565,7 +572,6 @@ func (mailfs *MailFileSystem) UploadFileEach(header *mail.Header, text []byte, f
 
 		mw.Close()
 
-		// ----- IMAP APPEND -----
 		mailData := mailBuf.Bytes()
 		appendCmd := mailfs.c.Append(mailfs.remoteDir, int64(len(mailData)), nil)
 		if _, err := appendCmd.Write(mailData); err != nil {
@@ -586,7 +592,10 @@ func (mailfs *MailFileSystem) UploadFileEach(header *mail.Header, text []byte, f
 	})
 }
 
-func (mailfs *MailFileSystem) GenHeader(fileName string, fBlockSeq int64, fBlockCount int64) (*mail.Header, error) {
+// GenHeader 生成邮件头
+// encrypted=true 时主题标记为 "encrypted" 并加密 fileName；
+// encrypted=false 时主题标记为 "plain"，fileName 保持原样。
+func (mailfs *MailFileSystem) GenHeader(fileName string, fBlockSeq int64, fBlockCount int64, encrypted bool) (*mail.Header, error) {
 	header := mail.Header{}
 	header.SetAddressList("From", []*mail.Address{{
 		Name:    "阳光",
@@ -598,7 +607,14 @@ func (mailfs *MailFileSystem) GenHeader(fileName string, fBlockSeq int64, fBlock
 		Address: "1096693846@qq.com",
 	}})
 
-	header.SetSubject(fmt.Sprintf("%v/%v/%v-%v", fileName, "plain", fBlockSeq, fBlockCount))
+	mode := "plain"
+	subjectName := fileName
+	if encrypted {
+		mode = "encrypted"
+		subjectName = Encrypt(fileName)
+	}
+
+	header.SetSubject(fmt.Sprintf("%v/%v/%v-%v", subjectName, mode, fBlockSeq, fBlockCount))
 	header.SetDate(time.Now())
 	header.SetContentType("multipart/mixed", nil)
 
@@ -608,7 +624,6 @@ func (mailfs *MailFileSystem) GenHeader(fileName string, fBlockSeq int64, fBlock
 func (mailfs *MailFileSystem) GetMailboxList() ([]string, error) {
 	var folders []string
 
-	// 网络操作：LIST，用 withRetry 包裹
 	err := mailfs.withRetry("GetMailboxList/LIST", func() error {
 		listCmd := mailfs.c.List("", "其他文件夹/*", nil)
 		mboxes, err := listCmd.Collect()

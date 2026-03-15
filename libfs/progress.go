@@ -40,6 +40,12 @@ func (mailfs *MailFileSystem) UploadFileWithProgress(path string, blockCb BlockP
 
 	logrus.Infof("remote: %v, upload file: %v", mailfs.remoteDir, path)
 
+	// 根据远程邮箱目录判断是否需要加密
+	encrypted := NeedEncryptByRemoteDir(mailfs.remoteDir)
+	if encrypted {
+		logrus.Infof("远程目录以.开头，将对文件路径信息进行加密上传: remoteDir=%v, file=%v", mailfs.remoteDir, path)
+	}
+
 	cacheFiles, err := getCacheFileFromDB(mailfs.remoteDir, path)
 	if err != nil {
 		return err
@@ -58,7 +64,7 @@ func (mailfs *MailFileSystem) UploadFileWithProgress(path string, blockCb BlockP
 	if cacheFile != nil && cacheFile.BlockCount == int64(len(cacheFile.Blocks)) {
 		logrus.Infof("ignore..., file has existed: %v", path)
 		if blockCb != nil {
-			blockCb(1, 1, filepath.Base(path)) // 已存在视为完成
+			blockCb(1, 1, filepath.Base(path))
 		}
 		return nil
 	}
@@ -112,9 +118,15 @@ func (mailfs *MailFileSystem) UploadFileWithProgress(path string, blockCb BlockP
 		md5byte := md5.Sum(fileBlock)
 		blockmd5 := hex.EncodeToString(md5byte[:])
 
-		header, err := mailfs.GenHeader(fileName, i, fBlockCount)
+		header, err := mailfs.GenHeader(fileName, i, fBlockCount, encrypted)
 		if err != nil {
 			return err
+		}
+
+		// 构造邮件正文：加密时对 localpath 加密
+		localPathForMail := path
+		if encrypted {
+			localPathForMail = Encrypt(path)
 		}
 
 		mailText := MailText{
@@ -124,7 +136,7 @@ func (mailfs *MailFileSystem) UploadFileWithProgress(path string, blockCb BlockP
 			Vblocksize:  int64(len(fileBlock)),
 			Vcreatetime: time.Now(),
 			Vowner:      "sunshine",
-			Vlocalpath:  path,
+			Vlocalpath:  localPathForMail,
 			Vmailfolder: mailfs.remoteDir,
 		}
 		mailText.Vsubject, err = header.Subject()
@@ -132,17 +144,20 @@ func (mailfs *MailFileSystem) UploadFileWithProgress(path string, blockCb BlockP
 			return err
 		}
 
-		// UploadFileEach 内部已包含 withRetry
-		if err = mailfs.UploadFileEach(header, MailTextToByte(&mailText), fileName, fileBlock); err != nil {
+		// 附件名也加密
+		attachName := fileName
+		if encrypted {
+			attachName = Encrypt(fileName)
+		}
+
+		if err = mailfs.UploadFileEach(header, MailTextToByte(&mailText), attachName, fileBlock); err != nil {
 			return err
 		}
 
-		// 触发块进度回调
 		if blockCb != nil {
 			blockCb(i, fBlockCount, fileName)
 		}
 
-		// 重置 slice 容量（fileBlock 可能被截断）
 		fileBlock = fileBlock[:FileBlockSize]
 	}
 
@@ -166,7 +181,6 @@ func (mailfs *MailFileSystem) UploadDirWithProgress(
 		return errors.New("not a dir")
 	}
 
-	// 先收集文件列表，计算总数
 	var files []string
 	_ = filepath.WalkDir(path, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -188,7 +202,6 @@ func (mailfs *MailFileSystem) UploadDirWithProgress(
 		}
 		if err := mailfs.UploadFileWithProgress(fp, blockCb); err != nil {
 			logrus.Errorf("UploadFileWithProgress error: %v", err)
-			// 继续上传其他文件，不中断
 		}
 	}
 	if fileCb != nil {
@@ -263,7 +276,6 @@ func (mailfs *MailFileSystem) DownloadCacheFileWithProgress(f CacheFile, blockCb
 		tmp := cacheBlockPath + ".tmp"
 		os.Remove(tmp)
 
-		// downloadUID 内部已包含 withRetry
 		mailText, b, err := mailfs.downloadUID(block.UID)
 		if err != nil {
 			return err
@@ -297,7 +309,6 @@ func (mailfs *MailFileSystem) DownloadCacheFileWithProgress(f CacheFile, blockCb
 		}
 	}
 
-	// 合并块
 	tmpf, err := os.OpenFile(saveTmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		return err
@@ -337,14 +348,13 @@ func (mailfs *MailFileSystem) DownloadCacheFileWithProgress(f CacheFile, blockCb
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// CheckIntegrity — 检查文件完整性：比对 blockcount 与实际缓存块数
+// CheckIntegrity — 检查文件完整性
 // ──────────────────────────────────────────────────────────────────────────────
 
-// IntegrityResult 单个文件的完整性检查结果
 type IntegrityResult struct {
 	File           CacheFile
-	CachedBlocks   int64 // 数据库中实际缓存的块数
-	ExpectedBlocks int64 // 应有的块数（BlockCount）
+	CachedBlocks   int64
+	ExpectedBlocks int64
 	OK             bool
 }
 
