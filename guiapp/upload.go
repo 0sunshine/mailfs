@@ -3,11 +3,13 @@ package guiapp
 import (
 	"fmt"
 	"mailfs/libfs"
+	"os"
 	"path/filepath"
 	"sort"
 	"sync"
 
 	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/theme"
@@ -26,6 +28,9 @@ type UploadPage struct {
 	uploadFileBtn *widget.Button
 	uploadDirBtn  *widget.Button
 	targetLabel   *widget.Label
+
+	// 拖拽提示区域
+	dropZone *dropZoneWidget
 
 	// 块级进度
 	blockBar   *widget.ProgressBar
@@ -48,7 +53,50 @@ func NewUploadPage(fs *libfs.MailFileSystem) *UploadPage {
 	}
 }
 
-func (p *UploadPage) SetWindow(w fyne.Window) { p.win = w }
+func (p *UploadPage) SetWindow(w fyne.Window) {
+	p.win = w
+
+	// 注册窗口级拖拽回调
+	w.SetOnDropped(func(pos fyne.Position, uris []fyne.URI) {
+		p.handleDrop(uris)
+	})
+}
+
+// handleDrop 处理从系统拖入的文件/文件夹
+func (p *UploadPage) handleDrop(uris []fyne.URI) {
+	if p.selFolder == "" {
+		p.setStatus("⚠ 请先在左侧选择目标文件夹，再拖入文件")
+		p.addLog("⚠ 拖拽被忽略：尚未选择目标文件夹")
+		return
+	}
+
+	if len(uris) == 0 {
+		return
+	}
+
+	go func() {
+		for _, uri := range uris {
+			path := uri.Path()
+			if path == "" {
+				continue
+			}
+
+			info, err := os.Stat(path)
+			if err != nil {
+				p.addLog(fmt.Sprintf("✗ 无法访问: %s — %v", path, err))
+				continue
+			}
+
+			if info.IsDir() {
+				p.addLog(fmt.Sprintf("📂 拖入文件夹: %s", filepath.Base(path)))
+				p.doUploadDir(path)
+			} else {
+				p.addLog(fmt.Sprintf("📄 拖入文件: %s", filepath.Base(path)))
+				p.doUploadFile(path)
+			}
+		}
+	}()
+}
 
 func (p *UploadPage) Content() fyne.CanvasObject {
 	// ── 左侧文件夹列表 ──────────────────────────────
@@ -70,6 +118,8 @@ func (p *UploadPage) Content() fyne.CanvasObject {
 		p.targetLabel.SetText(folder)
 		p.uploadFileBtn.Enable()
 		p.uploadDirBtn.Enable()
+		// 更新拖拽区提示
+		p.dropZone.SetActive(true)
 		go func() {
 			if err := p.fs.Enter(folder); err != nil {
 				p.setStatus(fmt.Sprintf("进入文件夹失败: %v", err))
@@ -106,6 +156,9 @@ func (p *UploadPage) Content() fyne.CanvasObject {
 	p.uploadDirBtn.Importance = widget.MediumImportance
 	p.uploadDirBtn.Disable()
 
+	// ── 拖拽提示区域 ───────────────────────────────
+	p.dropZone = newDropZoneWidget()
+
 	// ── 块级进度 ────────────────────────────────────
 	p.blockBar = widget.NewProgressBar()
 	p.blockBar.Hide()
@@ -133,6 +186,8 @@ func (p *UploadPage) Content() fyne.CanvasObject {
 		widget.NewSeparator(),
 		targetRow,
 		container.NewGridWithColumns(2, p.uploadFileBtn, p.uploadDirBtn),
+		widget.NewSeparator(),
+		p.dropZone,
 		widget.NewSeparator(),
 		blockRow,
 		fileRow,
@@ -371,4 +426,66 @@ func (p *UploadPage) setButtons(enabled bool) {
 			p.uploadDirBtn.Disable()
 		}
 	})
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// dropZoneWidget — 拖拽提示区域
+//
+// 在上传控制区显示一个带虚线边框的提示区域，告知用户可以拖拽文件/文件夹。
+// 选中目标文件夹后提示文字变为"就绪"状态。
+// ─────────────────────────────────────────────────────────────────────────────
+
+type dropZoneWidget struct {
+	widget.BaseWidget
+	active bool
+	label  *widget.Label
+	icon   *widget.Icon
+	border *canvas.Rectangle
+}
+
+func newDropZoneWidget() *dropZoneWidget {
+	lbl := widget.NewLabel("请先选择目标文件夹，然后拖拽文件或文件夹到窗口即可上传")
+	lbl.Alignment = fyne.TextAlignLeading
+	lbl.Wrapping = fyne.TextWrapWord
+
+	icon := widget.NewIcon(theme.UploadIcon())
+
+	border := canvas.NewRectangle(theme.DisabledColor())
+	border.StrokeWidth = 2
+	border.StrokeColor = theme.DisabledColor()
+	border.FillColor = theme.HoverColor()
+	border.CornerRadius = 8
+
+	d := &dropZoneWidget{
+		active: false,
+		label:  lbl,
+		icon:   icon,
+		border: border,
+	}
+	d.ExtendBaseWidget(d)
+	return d
+}
+
+func (d *dropZoneWidget) SetActive(active bool) {
+	d.active = active
+	fyne.Do(func() {
+		if active {
+			d.label.SetText("✓ 目标已就绪 — 拖拽文件或文件夹到窗口即可上传")
+			d.border.StrokeColor = theme.PrimaryColor()
+			d.border.FillColor = theme.SelectionColor()
+		} else {
+			d.label.SetText("请先选择目标文件夹，然后拖拽文件或文件夹到窗口即可上传")
+			d.border.StrokeColor = theme.DisabledColor()
+			d.border.FillColor = theme.HoverColor()
+		}
+		d.border.Refresh()
+	})
+}
+
+func (d *dropZoneWidget) CreateRenderer() fyne.WidgetRenderer {
+	// 图标在左，文字在右，水平排列，文字自动撑满剩余宽度
+	content := container.NewBorder(nil, nil, d.icon, nil, d.label)
+	return widget.NewSimpleRenderer(
+		container.NewStack(d.border, container.NewPadded(content)),
+	)
 }
