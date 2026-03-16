@@ -2,24 +2,31 @@ package libfs
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
+	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"github.com/emersion/go-imap/v2"
-	"github.com/emersion/go-imap/v2/imapclient"
-	"github.com/emersion/go-message/mail"
-	"github.com/sirupsen/logrus"
 	"io"
 	"mime/quotedprintable"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/emersion/go-imap/v2"
+	"github.com/emersion/go-imap/v2/imapclient"
+	"github.com/emersion/go-message/mail"
+	"github.com/sirupsen/logrus"
 )
 
 const FileBlockSize = 512 * 65536 //32M
+
+// 连接超时
+const dialTimeout = 15 * time.Second
 
 type MailFileSystem struct {
 	c               *imapclient.Client
@@ -62,19 +69,44 @@ func NewMailFileSystem() *MailFileSystem {
 	return &fs
 }
 
+// Login 带超时的登录：手动 TCP 拨号 + TLS 握手 + IMAP 登录，
+// 防止网络异常时 DialTLS 无限阻塞。
 func (mailfs *MailFileSystem) Login(usr string, pwd string) error {
-	var err error = nil
-	mailfs.c, err = imapclient.DialTLS("imap.qq.com:993", nil)
+	// ── 1. 带超时的 TCP 拨号 ──
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+
+	dialer := &net.Dialer{Timeout: dialTimeout}
+	conn, err := dialer.DialContext(ctx, "tcp", "imap.qq.com:993")
 	if err != nil {
-		logrus.Errorf("failed to dial IMAP server: %v", err)
-		return err
+		logrus.Errorf("TCP 拨号失败: %v", err)
+		return fmt.Errorf("TCP 拨号失败: %w", err)
 	}
 
-	if err = mailfs.c.Login(usr, pwd).Wait(); err != nil {
-		logrus.Errorf("failed to login: %v", err)
-		return err
+	// ── 2. 带超时的 TLS 握手 ──
+	tlsConn := tls.Client(conn, &tls.Config{ServerName: "imap.qq.com"})
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		conn.Close()
+		logrus.Errorf("TLS 握手失败: %v", err)
+		return fmt.Errorf("TLS 握手失败: %w", err)
 	}
 
+	// ── 3. 在已建立的 TLS 连接上创建 IMAP 客户端 ──
+	c := imapclient.New(tlsConn, nil)
+	if err != nil {
+		tlsConn.Close()
+		logrus.Errorf("创建 IMAP client 失败: %v", err)
+		return fmt.Errorf("创建 IMAP client 失败: %w", err)
+	}
+
+	// ── 4. IMAP LOGIN ──
+	if err = c.Login(usr, pwd).Wait(); err != nil {
+		c.Close()
+		logrus.Errorf("IMAP 登录失败: %v", err)
+		return fmt.Errorf("IMAP 登录失败: %w", err)
+	}
+
+	mailfs.c = c
 	mailfs.usr = usr
 	mailfs.pwd = pwd
 
@@ -82,11 +114,7 @@ func (mailfs *MailFileSystem) Login(usr string, pwd string) error {
 }
 
 func (mailfs *MailFileSystem) Logout() {
-	if mailfs.c == nil {
-		return
-	}
-	_ = mailfs.c.Logout()
-	mailfs.c = nil
+	mailfs.safeLogout()
 }
 
 func (mailfs *MailFileSystem) cacheUID(uids []imap.UID) error {
@@ -199,7 +227,9 @@ func (mailfs *MailFileSystem) CacheCurrDirWithProgress(progressCb CacheProgressF
 	logrus.Infof("UID has: %v", allUIDs)
 
 	total := len(allUIDs)
-	progressCb(1, total)
+	if progressCb != nil {
+		progressCb(1, total)
+	}
 
 	const UidsCount = 32
 
@@ -593,8 +623,6 @@ func (mailfs *MailFileSystem) UploadFileEach(header *mail.Header, text []byte, f
 }
 
 // GenHeader 生成邮件头
-// encrypted=true 时主题标记为 "encrypted" 并加密 fileName；
-// encrypted=false 时主题标记为 "plain"，fileName 保持原样。
 func (mailfs *MailFileSystem) GenHeader(fileName string, fBlockSeq int64, fBlockCount int64, encrypted bool) (*mail.Header, error) {
 	header := mail.Header{}
 	header.SetAddressList("From", []*mail.Address{{
