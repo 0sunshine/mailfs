@@ -1,6 +1,7 @@
 package guiapp
 
 import (
+	"encoding/base64"
 	"fmt"
 	"mailfs/libfs"
 	"sort"
@@ -17,6 +18,9 @@ import (
 )
 
 const downloadPageSize = 50
+
+// httpServerAddr HTTP 流媒体服务地址，与 main.go 中启动的端口一致
+const httpServerAddr = "http://127.0.0.1:9867"
 
 // ─────────────────────────────────────────────────────────────────────────────
 // DownloadPage
@@ -553,11 +557,16 @@ func (p *DownloadPage) showDownloadMenu(f libfs.CacheFile, pos fyne.Position) {
 		return
 	}
 	name := lastSegment(f.LocalPath)
+	httpURL := buildHTTPStreamURL(f.MailFolder, f.LocalPath)
 	menu := fyne.NewMenu("",
 		fyne.NewMenuItem("⬇  下载  "+name, func() {
 			go p.downloadFile(f)
 		}),
 		fyne.NewMenuItemSeparator(),
+		fyne.NewMenuItem("🔗  复制 HTTP 播放地址", func() {
+			p.win.Clipboard().SetContent(httpURL)
+			p.setStatus("已复制播放地址: " + name)
+		}),
 		fyne.NewMenuItem("📋  复制完整路径", func() {
 			p.win.Clipboard().SetContent(f.LocalPath)
 			p.setStatus("已复制: " + f.LocalPath)
@@ -567,6 +576,14 @@ func (p *DownloadPage) showDownloadMenu(f libfs.CacheFile, pos fyne.Position) {
 		}),
 	)
 	widget.ShowPopUpMenuAtPosition(menu, p.win.Canvas(), pos)
+}
+
+// buildHTTPStreamURL 生成 HTTP 流媒体播放地址
+// 格式: http://127.0.0.1:9867/httptoimap?imapdir=<base64url>&localpath=<base64url>
+func buildHTTPStreamURL(imapDir, localPath string) string {
+	dirB64 := base64.URLEncoding.EncodeToString([]byte(imapDir))
+	pathB64 := base64.URLEncoding.EncodeToString([]byte(localPath))
+	return fmt.Sprintf("%s/httptoimap?imapdir=%s&localpath=%s", httpServerAddr, dirB64, pathB64)
 }
 
 func (p *DownloadPage) downloadFile(f libfs.CacheFile) {

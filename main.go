@@ -6,6 +6,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"gopkg.in/natefinch/lumberjack.v2"
 	"mailfs/guiapp"
+	"mailfs/libfs"
 	"os"
 )
 
@@ -45,6 +46,11 @@ func main() {
 			fmt.Println(err)
 		}
 	}()
+
+	// 启动 HTTP-to-IMAP 流媒体服务（后台）
+	httpServer := libfs.NewHTTPIMAPServer(":9867")
+	httpServer.StartAsync()
+	logrus.Infof("HTTP streaming server started on :9867")
 
 	a := app.New()
 	a.Settings().SetTheme(&MailfsTheme{})
