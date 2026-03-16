@@ -47,10 +47,13 @@ func main() {
 		}
 	}()
 
-	// 启动 HTTP-to-IMAP 流媒体服务（后台）
-	httpServer := libfs.NewHTTPIMAPServer(":9867")
+	// 加载统一配置
+	cfg := libfs.LoadConfig()
+
+	// 启动 HTTP-to-IMAP 流媒体服务（后台），使用配置中的监听地址
+	httpServer := libfs.NewHTTPIMAPServer(cfg.HTTPListenAddr)
 	httpServer.StartAsync()
-	logrus.Infof("HTTP streaming server started on :9867")
+	logrus.Infof("HTTP streaming server started on %s", cfg.HTTPListenAddr)
 
 	a := app.New()
 	a.Settings().SetTheme(&MailfsTheme{})

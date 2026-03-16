@@ -165,7 +165,7 @@ func (mailfs *MailFileSystem) UploadFileWithProgress(path string, blockCb BlockP
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// UploadDirWithProgress — 带双层进度回调的目录上传
+// UploadDirWithProgress — 带双层进度回调的目录上传（支持后缀过滤）
 // ──────────────────────────────────────────────────────────────────────────────
 
 func (mailfs *MailFileSystem) UploadDirWithProgress(
@@ -182,11 +182,18 @@ func (mailfs *MailFileSystem) UploadDirWithProgress(
 	}
 
 	var files []string
+	var ignored int
 	_ = filepath.WalkDir(path, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
 		if d.Type().IsRegular() {
+			// 根据配置文件中的 ignore_extensions 过滤文件
+			if ShouldIgnoreFile(d.Name()) {
+				ignored++
+				logrus.Infof("跳过忽略后缀文件: %s", p)
+				return nil
+			}
 			abs, err := filepath.Abs(p)
 			if err == nil {
 				files = append(files, filepath.ToSlash(abs))
@@ -194,6 +201,10 @@ func (mailfs *MailFileSystem) UploadDirWithProgress(
 		}
 		return nil
 	})
+
+	if ignored > 0 {
+		logrus.Infof("目录上传: 共跳过 %d 个被忽略后缀的文件", ignored)
+	}
 
 	total := len(files)
 	for i, fp := range files {
