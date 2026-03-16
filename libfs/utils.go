@@ -101,10 +101,11 @@ func MailTextFromByte(s string) *MailText {
 }
 
 type CacheBlock struct {
-	FileID   int64
-	BlockSeq int64
-	UID      int64
-	BlockMD5 string
+	FileID    int64
+	BlockSeq  int64
+	UID       int64
+	BlockMD5  string
+	BlockSize int64 // 该块的实际大小（字节）
 }
 
 type CacheFile struct {
@@ -113,6 +114,7 @@ type CacheFile struct {
 	LocalPath  string
 	BlockCount int64
 	FileMD5    string
+	FileSize   int64 // 文件总大小（字节）
 	Blocks     []CacheBlock
 }
 
@@ -141,14 +143,13 @@ func md5File(path string) (string, error) {
 		return "", err
 	}
 
-	// 计算 MD5 并转换为十六进制字符串
 	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 type sqlCondition struct {
 	key   string
 	value interface{}
-	op    string // 可选，支持操作符
+	op    string
 }
 
 func sqlBuildQuery(table string, conditions []sqlCondition) (string, []interface{}) {

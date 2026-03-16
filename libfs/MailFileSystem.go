@@ -23,8 +23,6 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-const FileBlockSize = 512 * 65536 //32M
-
 // 连接超时
 const dialTimeout = 15 * time.Second
 
@@ -178,7 +176,7 @@ func (mailfs *MailFileSystem) cacheUID(uids []imap.UID) error {
 		}
 
 		if len(mailText.Vsubject) == 0 || len(mailText.Vlocalpath) == 0 {
-			logrus.Warnf("not a mailfs: %v, uid: ", msgUID)
+			logrus.Warnf("not a mailfs: %v, uid: %v", mailText.Vsubject, msgUID)
 			return nil
 		}
 
@@ -397,7 +395,7 @@ func (mailfs *MailFileSystem) downloadUID(uid int64) (*MailText, []byte, error) 
 		}
 
 		if len(mailText.Vsubject) == 0 || len(mailText.Vlocalpath) == 0 {
-			errStr := fmt.Sprintf("not a mailfs: %v, uid: ", uid)
+			errStr := fmt.Sprintf("not a mailfs: %v, uid: %v", mailText.Vsubject, uid)
 			logrus.Error(errStr)
 			return errors.New(errStr)
 		}
@@ -488,19 +486,19 @@ func (mailfs *MailFileSystem) DownloadCacheFile(f CacheFile) error {
 		if block.BlockMD5 != blockmd5 {
 			errStr := "block md5 not match"
 			logrus.Errorf(errStr)
-			return err
+			return errors.New(errStr)
 		}
 
 		if mailText.Vmailfolder != f.MailFolder {
 			errStr := "mailfolder not match"
 			logrus.Errorf(errStr)
-			return err
+			return errors.New(errStr)
 		}
 
 		if mailText.Vlocalpath != f.LocalPath {
 			errStr := "localpath not match"
 			logrus.Errorf(errStr)
-			return err
+			return errors.New(errStr)
 		}
 
 		logrus.Infof("uid: %v, blockmd5: %v, filesize: %v", block.UID, mailText.Vblockmd5, len(b))
@@ -553,7 +551,7 @@ func (mailfs *MailFileSystem) DownloadCacheFile(f CacheFile) error {
 
 	filemd5, _ := md5File(saveTmpPath)
 	if filemd5 != f.FileMD5 {
-		logrus.Errorf("file %v md5 not match, %v wanna(%v) error %v -> %v", saveTmpPath, filemd5, f.FileMD5)
+		logrus.Errorf("file %v md5 not match, %v wanna(%v) error", saveTmpPath, filemd5, f.FileMD5)
 		return errors.New("file md5 not match")
 	}
 
@@ -671,7 +669,7 @@ func (mailfs *MailFileSystem) GetMailboxList() ([]string, error) {
 		return folders, err
 	}
 
-	// 根据 folders.txt 配置文件过滤目录列表
+	// 根据配置文件过滤目录列表
 	allowed := LoadAllowedFolders()
 	folders = FilterFolders(folders, allowed)
 

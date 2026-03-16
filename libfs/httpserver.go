@@ -15,59 +15,33 @@ import (
 
 // ──────────────────────────────────────────────────────────────────────────────
 // HTTPIMAPServer — 通过 HTTP 流式播放 IMAP 邮件附件
-//
-// 架构：生产者-消费者
-//
-//   HTTP 请求（消费者）：计算所需块 → 查缓存 → 命中直接返回 →
-//       未命中则提交下载任务并等待（最多 60s）
-//
-//   下载调度器（生产者）：3 个 worker goroutine 从队列按序取任务 →
-//       IMAP FETCH → 结果写入 LRU 缓存 → 通知等待者
-//
-//   取消联动：HTTP 断开 → 任务的 ctx 被取消 →
-//       排队中的任务被跳过 / 正在下载的任务中止
 // ──────────────────────────────────────────────────────────────────────────────
 
 const (
-	DefaultBlockCacheSize = 8
+	DefaultBlockCacheSize = 32
 	MaxIMAPWorkers        = 3
 	BlockWaitTimeout      = 60 * time.Second
 )
-
-// ──────────────────────────────────────────────────────────────────────────────
-// downloadTask — 提交给 worker pool 的下载任务
-// ──────────────────────────────────────────────────────────────────────────────
 
 type downloadTask struct {
 	imapDir string
 	uid     int64
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// blockWaiter — 对同一个块的等待去重
-//
-// 多个 HTTP 请求可能同时需要同一个块（如播放器发探测请求+正式请求），
-// 只需下载一次，所有等待者共享同一个 done channel。
-// ──────────────────────────────────────────────────────────────────────────────
-
 type blockWaiter struct {
 	done    chan struct{}
 	err     error
-	refCtxs []context.Context // 所有等待该块的请求 ctx
+	refCtxs []context.Context
 }
-
-// ──────────────────────────────────────────────────────────────────────────────
-// HTTPIMAPServer
-// ──────────────────────────────────────────────────────────────────────────────
 
 type HTTPIMAPServer struct {
 	addr       string
 	blockCache *BlockLRUCache
 
-	taskQueue chan *downloadTask // 任务队列，worker 从此取任务
+	taskQueue chan *downloadTask
 
 	waiterMu sync.Mutex
-	waiters  map[string]*blockWaiter // key → 正在下载/排队中的块等待器
+	waiters  map[string]*blockWaiter
 }
 
 func NewHTTPIMAPServer(addr string, cacheBlocks ...int) *HTTPIMAPServer {
@@ -83,13 +57,12 @@ func NewHTTPIMAPServer(addr string, cacheBlocks ...int) *HTTPIMAPServer {
 		waiters:    make(map[string]*blockWaiter),
 	}
 
-	// 启动 worker pool
 	for i := 0; i < MaxIMAPWorkers; i++ {
 		go srv.downloadWorker(i)
 	}
 
-	logrus.Infof("[HTTP] 初始化: IMAP workers=%d, 缓存=%d块(≈%dMB), 等待超时=%v",
-		MaxIMAPWorkers, n, int64(n)*FileBlockSize/(1024*1024), BlockWaitTimeout)
+	logrus.Infof("[HTTP] 初始化: IMAP workers=%d, 缓存=%d块, 等待超时=%v",
+		MaxIMAPWorkers, n, BlockWaitTimeout)
 	return srv
 }
 
@@ -110,7 +83,7 @@ func (s *HTTPIMAPServer) StartAsync() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// downloadWorker — 后台 IMAP 下载 worker
+// downloadWorker
 // ──────────────────────────────────────────────────────────────────────────────
 
 func (s *HTTPIMAPServer) downloadWorker(id int) {
@@ -123,14 +96,12 @@ func (s *HTTPIMAPServer) downloadWorker(id int) {
 func (s *HTTPIMAPServer) executeTask(workerID int, task *downloadTask) {
 	key := blockCacheKey(task.imapDir, task.uid)
 
-	// 再查一次缓存（可能在排队期间被别的 worker 填充了）
 	if _, _, hit := s.blockCache.Get(task.imapDir, task.uid); hit {
 		logrus.Debugf("[Worker %d] 排队期间缓存已命中: %s", workerID, key)
 		s.finishWaiter(key, nil)
 		return
 	}
 
-	// 检查是否还有活跃的等待者，全部断开则跳过
 	if s.allWaitersCancelled(key) {
 		logrus.Debugf("[Worker %d] 所有等待者已断开，跳过: %s", workerID, key)
 		s.finishWaiter(key, context.Canceled)
@@ -141,7 +112,6 @@ func (s *HTTPIMAPServer) executeTask(workerID int, task *downloadTask) {
 
 	mt, data, err := downloadUIDForHTTP(task.imapDir, task.uid)
 	if err != nil {
-		// 下载失败，但如果所有等待者都已断开，只是静默丢弃
 		if s.allWaitersCancelled(key) {
 			logrus.Debugf("[Worker %d] 下载出错但所有等待者已断开: %s", workerID, key)
 			s.finishWaiter(key, context.Canceled)
@@ -152,13 +122,11 @@ func (s *HTTPIMAPServer) executeTask(workerID int, task *downloadTask) {
 		return
 	}
 
-	// 无论等待者是否还在，数据拿到了就写入缓存（下次可命中）
 	s.blockCache.Put(task.imapDir, task.uid, mt, data)
 	logrus.Debugf("[Worker %d] 下载完成并缓存: %s, %d bytes", workerID, key, len(data))
 	s.finishWaiter(key, nil)
 }
 
-// finishWaiter 通知所有等待该块的请求
 func (s *HTTPIMAPServer) finishWaiter(key string, err error) {
 	s.waiterMu.Lock()
 	w, ok := s.waiters[key]
@@ -170,7 +138,6 @@ func (s *HTTPIMAPServer) finishWaiter(key string, err error) {
 	s.waiterMu.Unlock()
 }
 
-// allWaitersCancelled 检查某个块的所有等待者是否都已取消
 func (s *HTTPIMAPServer) allWaitersCancelled(key string) bool {
 	s.waiterMu.Lock()
 	defer s.waiterMu.Unlock()
@@ -187,44 +154,32 @@ func (s *HTTPIMAPServer) allWaitersCancelled(key string) bool {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// fetchBlock — HTTP 请求调用的块获取入口
-//
-// 1. 查缓存 → 命中直接返回
-// 2. 未命中 → 提交下载任务（去重）→ 等待完成或超时
-// 3. 完成后再从缓存取数据返回
+// fetchBlock
 // ──────────────────────────────────────────────────────────────────────────────
 
 func (s *HTTPIMAPServer) fetchBlock(ctx context.Context, imapDir string, uid int64) (*MailText, []byte, error) {
-	// 总超时：从首次调用开始计算
 	deadline := time.NewTimer(BlockWaitTimeout)
 	defer deadline.Stop()
 
 	for {
-		// 1. 查缓存
 		if mt, data, hit := s.blockCache.Get(imapDir, uid); hit {
 			return mt, data, nil
 		}
 
-		// 2. 请求已断开
 		if ctx.Err() != nil {
 			return nil, nil, fmt.Errorf("request cancelled: %w", ctx.Err())
 		}
 
-		// 3. 提交下载任务并获取等待通道
 		done, err := s.submitDownload(ctx, imapDir, uid)
 		if err != nil {
-			// submitDownload 返回错误只在入队时 ctx 已断开
 			return nil, nil, err
 		}
 
-		// 4. 等待：缓存被填充 / 超时 / 请求断开
 		select {
 		case <-done:
-			// 任务完成 → 检查缓存
 			if mt, data, hit := s.blockCache.Get(imapDir, uid); hit {
 				return mt, data, nil
 			}
-			// 缓存中没数据（任务被跳过或失败），循环重新提交
 			logrus.Debugf("[fetchBlock] done 但缓存未命中 uid=%d，重新提交", uid)
 			continue
 		case <-ctx.Done():
@@ -235,14 +190,11 @@ func (s *HTTPIMAPServer) fetchBlock(ctx context.Context, imapDir string, uid int
 	}
 }
 
-// submitDownload 提交下载任务，返回等待通道。
-// 对同一个块做去重：如果已有任务在排队/下载中，直接复用其 done channel。
 func (s *HTTPIMAPServer) submitDownload(ctx context.Context, imapDir string, uid int64) (chan struct{}, error) {
 	key := blockCacheKey(imapDir, uid)
 
 	s.waiterMu.Lock()
 
-	// 已有等待器 → 去重，加入等待者列表
 	if w, ok := s.waiters[key]; ok {
 		w.refCtxs = append(w.refCtxs, ctx)
 		done := w.done
@@ -251,7 +203,6 @@ func (s *HTTPIMAPServer) submitDownload(ctx context.Context, imapDir string, uid
 		return done, nil
 	}
 
-	// 新建等待器
 	w := &blockWaiter{
 		done:    make(chan struct{}),
 		refCtxs: []context.Context{ctx},
@@ -259,7 +210,6 @@ func (s *HTTPIMAPServer) submitDownload(ctx context.Context, imapDir string, uid
 	s.waiters[key] = w
 	s.waiterMu.Unlock()
 
-	// 提交任务到队列（task 不绑定单个请求的 ctx）
 	task := &downloadTask{
 		imapDir: imapDir,
 		uid:     uid,
@@ -269,8 +219,6 @@ func (s *HTTPIMAPServer) submitDownload(ctx context.Context, imapDir string, uid
 	case s.taskQueue <- task:
 		logrus.Debugf("[Scheduler] 任务入队: %s", key)
 	case <-ctx.Done():
-		// 当前请求断开了，但可能有其他等待者（去重场景）
-		// 不清理 waiter，让 worker 通过 allWaitersCancelled 判断
 		return nil, fmt.Errorf("request cancelled before task enqueued: %w", ctx.Err())
 	}
 
@@ -278,7 +226,72 @@ func (s *HTTPIMAPServer) submitDownload(ctx context.Context, imapDir string, uid
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// HTTP 处理 — 不限并发，所有请求查缓存等待
+// blockOffsetTable — 根据数据库中每块的 blocksize 构建累积偏移表
+//
+// 返回 offsets 长度 = len(blocks)+1，offsets[i] 是第 i 块的起始字节偏移，
+// offsets[len(blocks)] 是文件总大小。
+// 如果数据库中的 blocksize 为 0（旧数据），则回退使用 DefaultFileBlockSize。
+// ──────────────────────────────────────────────────────────────────────────────
+
+func buildBlockOffsets(blocks []CacheBlock, fileSize int64) []int64 {
+	n := len(blocks)
+	offsets := make([]int64, n+1)
+	offsets[0] = 0
+
+	allZero := true
+	for _, b := range blocks {
+		if b.BlockSize > 0 {
+			allZero = false
+			break
+		}
+	}
+
+	if allZero && fileSize > 0 {
+		// 旧数据：blocksize 全为 0，回退用 DefaultFileBlockSize 估算
+		for i := 0; i < n; i++ {
+			if i < n-1 {
+				offsets[i+1] = offsets[i] + DefaultFileBlockSize
+			} else {
+				offsets[i+1] = fileSize
+			}
+		}
+		return offsets
+	}
+
+	for i, b := range blocks {
+		bs := b.BlockSize
+		if bs <= 0 {
+			// 单块缺失 blocksize，用默认值
+			bs = DefaultFileBlockSize
+		}
+		offsets[i+1] = offsets[i] + bs
+	}
+
+	// 如果有 fileSize 且比累积偏移更可靠，用 fileSize 修正最后一块
+	if fileSize > 0 && offsets[n] != fileSize {
+		offsets[n] = fileSize
+	}
+
+	return offsets
+}
+
+// findBlockForOffset 在 offsets 表中找到给定字节偏移所在的块索引和块内偏移
+func findBlockForOffset(offsets []int64, byteOffset int64) (blockIdx int, offsetInBlock int64) {
+	n := len(offsets) - 1 // 块数
+	for i := 0; i < n; i++ {
+		if byteOffset < offsets[i+1] {
+			return i, byteOffset - offsets[i]
+		}
+	}
+	// 落在最后一块
+	if n > 0 {
+		return n - 1, byteOffset - offsets[n-1]
+	}
+	return 0, byteOffset
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// HTTP 处理
 // ──────────────────────────────────────────────────────────────────────────────
 
 func (s *HTTPIMAPServer) handleStream(w http.ResponseWriter, r *http.Request) {
@@ -330,22 +343,41 @@ func (s *HTTPIMAPServer) handleStream(w http.ResponseWriter, r *http.Request) {
 
 	sortBlocks(cf.Blocks)
 
-	// ── 获取第一块确定文件大小 ──────────────────────
-	firstBlock := cf.Blocks[0]
-	mailText, firstBlockData, err := s.fetchBlock(ctx, imapDir, firstBlock.UID)
-	if err != nil {
-		if ctx.Err() != nil {
+	// ── 确定文件总大小 ──────────────────────────────
+	// 优先使用数据库中记录的 filesize
+	totalSize := cf.FileSize
+
+	if totalSize <= 0 {
+		// 数据库无 filesize（旧数据），需 fetch 首块来获取
+		firstBlock := cf.Blocks[0]
+		mailText, firstBlockData, err := s.fetchBlock(ctx, imapDir, firstBlock.UID)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			logrus.Errorf("[HTTP] 首块获取失败: %v", err)
+			http.Error(w, "failed to get first block", http.StatusInternalServerError)
 			return
 		}
-		logrus.Errorf("[HTTP] 首块获取失败: %v", err)
-		http.Error(w, "failed to get first block", http.StatusInternalServerError)
-		return
+
+		totalSize = mailText.Vfilesize
+		if totalSize <= 0 {
+			// 最后手段：用块偏移表估算
+			offsets := buildBlockOffsets(cf.Blocks, 0)
+			// 修正最后一块：用实际首块数据长度
+			if len(cf.Blocks) == 1 {
+				totalSize = int64(len(firstBlockData))
+			} else {
+				totalSize = offsets[len(cf.Blocks)]
+			}
+		}
+
+		// 将 firstBlockData 写入缓存以避免重复 fetch
+		_ = firstBlockData // 首块已在 LRU 缓存中（fetchBlock 内部会 Put）
 	}
 
-	totalSize := mailText.Vfilesize
-	if totalSize <= 0 {
-		totalSize = (cf.BlockCount-1)*FileBlockSize + int64(len(firstBlockData))
-	}
+	// ── 构建块偏移表 ────────────────────────────────
+	offsets := buildBlockOffsets(cf.Blocks, totalSize)
 
 	// ── 解析 Range ──────────────────────────────────
 	rangeHeader := r.Header.Get("Range")
@@ -379,9 +411,8 @@ func (s *HTTPIMAPServer) handleStream(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}
 
-	// ── 逐块写入响应 ────────────────────────────────
-	startBlockIdx := rangeStart / FileBlockSize
-	startOffsetInBlock := rangeStart % FileBlockSize
+	// ── 逐块写入响应（使用偏移表定位）────────────────
+	startBlockIdx, startOffsetInBlock := findBlockForOffset(offsets, rangeStart)
 	bytesRemaining := contentLen
 	flusher, canFlush := w.(http.Flusher)
 
@@ -391,26 +422,19 @@ func (s *HTTPIMAPServer) handleStream(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if int(blockIdx) >= len(cf.Blocks) {
+		if blockIdx >= len(cf.Blocks) {
 			break
 		}
 
-		var blockData []byte
-
-		if blockIdx == 0 && firstBlockData != nil {
-			blockData = firstBlockData
-			firstBlockData = nil
-		} else {
-			block := cf.Blocks[blockIdx]
-			_, blockData, err = s.fetchBlock(ctx, imapDir, block.UID)
-			if err != nil {
-				if ctx.Err() != nil {
-					logrus.Infof("[HTTP] 客户端断开（块 %d 等待中）", blockIdx+1)
-				} else {
-					logrus.Errorf("[HTTP] 块 %d 获取失败: %v", blockIdx+1, err)
-				}
-				return
+		block := cf.Blocks[blockIdx]
+		_, blockData, err := s.fetchBlock(ctx, imapDir, block.UID)
+		if err != nil {
+			if ctx.Err() != nil {
+				logrus.Infof("[HTTP] 客户端断开（块 %d 等待中）", blockIdx+1)
+			} else {
+				logrus.Errorf("[HTTP] 块 %d 获取失败: %v", blockIdx+1, err)
 			}
+			return
 		}
 
 		offsetInBlock := int64(0)

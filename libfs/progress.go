@@ -85,21 +85,25 @@ func (mailfs *MailFileSystem) UploadFileWithProgress(path string, blockCb BlockP
 		return err
 	}
 
+	// 根据文件后缀从配置获取块大小
+	fileName := filepath.Base(path)
+	blockSize := GetBlockSizeForFile(fileName)
+	logrus.Infof("文件 %s 使用块大小: %dMB", fileName, blockSize/(1024*1024))
+
 	var fSize int64 = fInfo.Size()
-	var fBlockCount int64 = fSize / FileBlockSize
-	if fSize%FileBlockSize != 0 {
+	var fBlockCount int64 = fSize / blockSize
+	if fSize%blockSize != 0 {
 		fBlockCount++
 	}
 
-	fileName := filepath.Base(path)
-	fileBlock := make([]byte, FileBlockSize)
+	fileBlock := make([]byte, blockSize)
 
 	for i := int64(1); i <= fBlockCount; i++ {
 		blockExisted := blockContains(cacheFile, i)
 		if blockExisted {
 			logrus.Infof("ignore..., block has existed: %v", i)
 
-			_, err = f.Seek(FileBlockSize, io.SeekCurrent)
+			_, err = f.Seek(blockSize, io.SeekCurrent)
 			if err != nil {
 				return err
 			}
@@ -111,7 +115,7 @@ func (mailfs *MailFileSystem) UploadFileWithProgress(path string, blockCb BlockP
 		if err != nil {
 			return err
 		}
-		if n < FileBlockSize {
+		if int64(n) < blockSize {
 			fileBlock = fileBlock[:n]
 		}
 
@@ -158,7 +162,7 @@ func (mailfs *MailFileSystem) UploadFileWithProgress(path string, blockCb BlockP
 			blockCb(i, fBlockCount, fileName)
 		}
 
-		fileBlock = fileBlock[:FileBlockSize]
+		fileBlock = fileBlock[:blockSize]
 	}
 
 	return nil
@@ -188,7 +192,6 @@ func (mailfs *MailFileSystem) UploadDirWithProgress(
 			return nil
 		}
 		if d.Type().IsRegular() {
-			// 根据配置文件中的 ignore_extensions 过滤文件
 			if ShouldIgnoreFile(d.Name()) {
 				ignored++
 				logrus.Infof("跳过忽略后缀文件: %s", p)

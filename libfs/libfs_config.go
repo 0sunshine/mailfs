@@ -2,6 +2,7 @@ package libfs
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -10,6 +11,9 @@ import (
 )
 
 const configPath = "config.yaml"
+
+// DefaultFileBlockSize 默认块大小 32MB（向后兼容旧常量）
+const DefaultFileBlockSize = 512 * 65536 // 32MB
 
 // AppConfig 统一配置结构
 type AppConfig struct {
@@ -21,6 +25,10 @@ type AppConfig struct {
 	AllowedFolders []string `yaml:"allowed_folders"`
 	// 目录上传时忽略的文件后缀（不区分大小写）
 	IgnoreExtensions []string `yaml:"ignore_extensions"`
+	// 默认块大小（字节）
+	DefaultBlockSize int64 `yaml:"default_block_size"`
+	// 按文件后缀配置块大小（字节），key 为后缀如 ".mp4"
+	BlockSizes map[string]int64 `yaml:"block_sizes"`
 }
 
 var (
@@ -35,11 +43,12 @@ func defaultConfig() *AppConfig {
 		HTTPCopyAddr:     "http://127.0.0.1:9867",
 		AllowedFolders:   []string{},
 		IgnoreExtensions: []string{},
+		DefaultBlockSize: DefaultFileBlockSize,
+		BlockSizes:       map[string]int64{},
 	}
 }
 
 // LoadConfig 从 config.yaml 加载配置，仅加载一次。
-// 后续调用返回缓存的配置。
 func LoadConfig() *AppConfig {
 	globalConfigOnce.Do(func() {
 		globalConfig = loadConfigFromFile()
@@ -47,7 +56,7 @@ func LoadConfig() *AppConfig {
 	return globalConfig
 }
 
-// ReloadConfig 强制重新加载配置（用于测试或热更新场景）
+// ReloadConfig 强制重新加载配置
 func ReloadConfig() *AppConfig {
 	globalConfigOnce = sync.Once{}
 	return LoadConfig()
@@ -76,15 +85,30 @@ func loadConfigFromFile() *AppConfig {
 		cfg.IgnoreExtensions[i] = strings.ToLower(ext)
 	}
 
-	logrus.Infof("已加载配置: listen=%s, copy=%s, folders=%d, ignore_ext=%d",
+	// 默认块大小兜底
+	if cfg.DefaultBlockSize <= 0 {
+		cfg.DefaultBlockSize = DefaultFileBlockSize
+	}
+
+	// 将 BlockSizes 的 key 统一转为小写
+	normalized := make(map[string]int64, len(cfg.BlockSizes))
+	for ext, size := range cfg.BlockSizes {
+		if size > 0 {
+			normalized[strings.ToLower(ext)] = size
+		}
+	}
+	cfg.BlockSizes = normalized
+
+	logrus.Infof("已加载配置: listen=%s, copy=%s, folders=%d, ignore_ext=%d, default_block=%dMB, block_rules=%d",
 		cfg.HTTPListenAddr, cfg.HTTPCopyAddr,
-		len(cfg.AllowedFolders), len(cfg.IgnoreExtensions))
+		len(cfg.AllowedFolders), len(cfg.IgnoreExtensions),
+		cfg.DefaultBlockSize/(1024*1024), len(cfg.BlockSizes))
 
 	return cfg
 }
 
 // ──────────────────────────────────────────────────────────────────
-// 向后兼容的辅助函数
+// 辅助函数
 // ──────────────────────────────────────────────────────────────────
 
 // LoadAllowedFolders 从统一配置中返回允许显示的目录集合。
@@ -116,7 +140,7 @@ func FilterFolders(folders []string, allowed map[string]bool) []string {
 	return filtered
 }
 
-// ShouldIgnoreFile 判断文件是否应在目录上传时被忽略（基于后缀匹配）。
+// ShouldIgnoreFile 判断文件是否应在目录上传时被忽略。
 func ShouldIgnoreFile(fileName string) bool {
 	cfg := LoadConfig()
 	if len(cfg.IgnoreExtensions) == 0 {
@@ -129,4 +153,17 @@ func ShouldIgnoreFile(fileName string) bool {
 		}
 	}
 	return false
+}
+
+// GetBlockSizeForFile 根据文件名后缀返回该文件应使用的块大小。
+// 优先匹配 block_sizes 中的后缀规则，未匹配则返回 default_block_size。
+func GetBlockSizeForFile(fileName string) int64 {
+	cfg := LoadConfig()
+	ext := strings.ToLower(filepath.Ext(fileName))
+	if ext != "" {
+		if size, ok := cfg.BlockSizes[ext]; ok {
+			return size
+		}
+	}
+	return cfg.DefaultBlockSize
 }
