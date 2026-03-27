@@ -131,6 +131,17 @@ func blockContains(f *CacheFile, seq int64) bool {
 	return false
 }
 
+// LastSegment 取路径最后一段（文件名或目录名）
+func LastSegment(path string) string {
+	path = strings.ReplaceAll(path, "\\", "/")
+	path = strings.TrimRight(path, "/")
+	idx := strings.LastIndex(path, "/")
+	if idx < 0 {
+		return path
+	}
+	return path[idx+1:]
+}
+
 func md5File(path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {

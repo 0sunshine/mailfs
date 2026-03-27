@@ -17,14 +17,31 @@ const DefaultFileBlockSize = 512 * 65536 // 32MB
 
 // AppConfig 统一配置结构
 type AppConfig struct {
+	// ── IMAP 连接配置 ──
+	// IMAP 服务器地址（含端口），如 "imap.qq.com:993"
+	IMAPServer string `yaml:"imap_server"`
+	// 凭据文件路径，文件第一行为用户名，第二行为密码
+	CredentialFile string `yaml:"credential_file"`
+	// 邮件显示名（From/To 的 Name 字段）
+	EmailName string `yaml:"email_name"`
+	// 邮箱目录前缀（用于 IMAP LIST 命令），如 "其他文件夹/*"
+	MailboxPrefix string `yaml:"mailbox_prefix"`
+	// 下载文件存储根目录
+	DownloadDir string `yaml:"download_dir"`
+
+	// ── HTTP 流媒体配置 ──
 	// HTTP 流媒体服务监听地址
 	HTTPListenAddr string `yaml:"http_listen_addr"`
 	// 复制 HTTP 播放链接时使用的地址
 	HTTPCopyAddr string `yaml:"http_copy_addr"`
+
+	// ── 文件与目录过滤 ──
 	// 允许显示的邮箱远程目录列表
 	AllowedFolders []string `yaml:"allowed_folders"`
 	// 目录上传时忽略的文件后缀（不区分大小写）
 	IgnoreExtensions []string `yaml:"ignore_extensions"`
+
+	// ── 块大小配置 ──
 	// 默认块大小（字节）
 	DefaultBlockSize int64 `yaml:"default_block_size"`
 	// 按文件后缀配置块大小（字节），key 为后缀如 ".mp4"
@@ -39,6 +56,11 @@ var (
 // defaultConfig 返回默认配置
 func defaultConfig() *AppConfig {
 	return &AppConfig{
+		IMAPServer:       "imap.qq.com:993",
+		CredentialFile:   "passwd.txt",
+		EmailName:        "mailfs",
+		MailboxPrefix:    "其他文件夹/*",
+		DownloadDir:      "D:/",
 		HTTPListenAddr:   ":9867",
 		HTTPCopyAddr:     "http://127.0.0.1:9867",
 		AllowedFolders:   []string{},
@@ -99,7 +121,8 @@ func loadConfigFromFile() *AppConfig {
 	}
 	cfg.BlockSizes = normalized
 
-	logrus.Infof("已加载配置: listen=%s, copy=%s, folders=%d, ignore_ext=%d, default_block=%dMB, block_rules=%d",
+	logrus.Infof("已加载配置: imap=%s, cred=%s, prefix=%s, listen=%s, copy=%s, folders=%d, ignore_ext=%d, default_block=%dMB, block_rules=%d",
+		cfg.IMAPServer, cfg.CredentialFile, cfg.MailboxPrefix,
 		cfg.HTTPListenAddr, cfg.HTTPCopyAddr,
 		len(cfg.AllowedFolders), len(cfg.IgnoreExtensions),
 		cfg.DefaultBlockSize/(1024*1024), len(cfg.BlockSizes))

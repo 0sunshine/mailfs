@@ -3,17 +3,13 @@ package libfs
 import (
 	"bytes"
 	"context"
-	"crypto/md5"
 	"crypto/tls"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"mime/quotedprintable"
 	"net"
 	"os"
-	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
@@ -34,6 +30,9 @@ type MailFileSystem struct {
 	// 保存登录凭据，用于网络错误后自动重连
 	usr string
 	pwd string
+
+	// 统一配置（IMAP 服务器地址、邮件名等从此处读取）
+	cfg *AppConfig
 }
 
 func readPasswd(path string) ([]string, error) {
@@ -51,41 +50,55 @@ func readPasswd(path string) ([]string, error) {
 }
 
 func NewMailFileSystem() *MailFileSystem {
-	fs := MailFileSystem{}
+	cfg := LoadConfig()
+	fs := &MailFileSystem{cfg: cfg}
 
-	lines, err := readPasswd("passwd.txt")
+	lines, err := readPasswd(cfg.CredentialFile)
 	if err != nil {
-		logrus.Errorf("read passwd.txt error: %v\n", err)
-		os.Exit(1)
+		logrus.Errorf("read %s error: %v", cfg.CredentialFile, err)
+		return fs // 返回未登录实例，方法调用时会返回 "not login" 错误
 	}
 
 	if err := fs.Login(lines[0], lines[1]); err != nil {
-		logrus.Errorf("login error: %v\n", err)
+		logrus.Errorf("login error: %v", err)
 	}
 
-	fs.SetDownloadRootDir("D:/")
-	return &fs
+	if cfg.DownloadDir != "" {
+		fs.SetDownloadRootDir(cfg.DownloadDir)
+	}
+
+	return fs
 }
 
 // Login 带超时的登录：手动 TCP 拨号 + TLS 握手 + IMAP 登录，
 // 防止网络异常时 DialTLS 无限阻塞。
 func (mailfs *MailFileSystem) Login(usr string, pwd string) error {
+	// 从配置获取 IMAP 服务器地址
+	server := "imap.qq.com:993"
+	if mailfs.cfg != nil && mailfs.cfg.IMAPServer != "" {
+		server = mailfs.cfg.IMAPServer
+	}
+	host, _, err := net.SplitHostPort(server)
+	if err != nil {
+		host = server // 无端口时整体作为主机名
+	}
+
 	// ── 1. 带超时的 TCP 拨号 ──
 	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer cancel()
 
 	dialer := &net.Dialer{Timeout: dialTimeout}
-	conn, err := dialer.DialContext(ctx, "tcp", "imap.qq.com:993")
+	conn, err := dialer.DialContext(ctx, "tcp", server)
 	if err != nil {
-		logrus.Errorf("TCP 拨号失败: %v", err)
+		logrus.Errorf("TCP 拨号失败 (%s): %v", server, err)
 		return fmt.Errorf("TCP 拨号失败: %w", err)
 	}
 
 	// ── 2. 带超时的 TLS 握手 ──
-	tlsConn := tls.Client(conn, &tls.Config{ServerName: "imap.qq.com"})
+	tlsConn := tls.Client(conn, &tls.Config{ServerName: host})
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		conn.Close()
-		logrus.Errorf("TLS 握手失败: %v", err)
+		logrus.Errorf("TLS 握手失败 (%s): %v", host, err)
 		return fmt.Errorf("TLS 握手失败: %w", err)
 	}
 
@@ -412,163 +425,6 @@ func (mailfs *MailFileSystem) downloadUID(uid int64) (*MailText, []byte, error) 
 	return mailText, fileData, err
 }
 
-func (mailfs *MailFileSystem) DownloadCacheFile(f CacheFile) error {
-	if mailfs.c == nil {
-		return errors.New("not login")
-	}
-
-	var err error
-
-	if mailfs.remoteDir != f.MailFolder {
-		if err = mailfs.Enter(f.MailFolder); err != nil {
-			logrus.Errorf("Enter error: %v", err)
-			return errors.New("can't not enter dir")
-		}
-	}
-
-	if f.Blocks == nil {
-		if f.Blocks, err = getCacheBlockFromDB(f.FileID); err != nil {
-			logrus.Errorf("getCacheBlockFromDB error: %v", err)
-			return errors.New("getCacheBlockFromDB error")
-		}
-	}
-
-	if int64(len(f.Blocks)) != f.BlockCount {
-		errStr := fmt.Sprintf("error, because want block count(%v), but only cache(%v)", len(f.Blocks), f.BlockCount)
-		logrus.Errorf("%v", errStr)
-		return errors.New(errStr)
-	}
-
-	p := strings.Split(f.LocalPath, "/")
-	p[0] = p[0][:1]
-	savePath := strings.Join(p, "/")
-	savePath = mailfs.downloadRootDir + savePath
-	saveTmpPath := savePath + ".tmp"
-
-	_, err = os.Stat(savePath)
-	if err == nil {
-		logrus.Debugf("file exist, %v", savePath)
-		return nil
-	}
-
-	os.Remove(saveTmpPath)
-
-	filename := filepath.Base(savePath)
-	path := filepath.Dir(savePath)
-	fileCachePath := path + "/mailfscache_" + f.FileMD5
-
-	logrus.Infof("%s %s", filename, path)
-
-	if err := os.MkdirAll(fileCachePath, 0755); err != nil {
-		logrus.Errorf("mkdir fail: %v", err)
-		return err
-	}
-
-	for _, block := range f.Blocks {
-		cacheBlockPath := fileCachePath + "/" + strconv.FormatInt(block.BlockSeq, 10)
-
-		_, err := os.Stat(cacheBlockPath)
-		if err == nil {
-			logrus.Debugf("block exist, block seq: %v", block.BlockSeq)
-			continue
-		}
-
-		tmp := cacheBlockPath + ".tmp"
-		os.Remove(tmp)
-
-		mailText, b, err := mailfs.downloadUID(block.UID)
-		if err != nil {
-			return err
-		}
-
-		md5byte := md5.Sum(b)
-		blockmd5 := hex.EncodeToString(md5byte[:])
-		if block.BlockMD5 != blockmd5 {
-			errStr := "block md5 not match"
-			logrus.Errorf(errStr)
-			return errors.New(errStr)
-		}
-
-		if mailText.Vmailfolder != f.MailFolder {
-			errStr := "mailfolder not match"
-			logrus.Errorf(errStr)
-			return errors.New(errStr)
-		}
-
-		if mailText.Vlocalpath != f.LocalPath {
-			errStr := "localpath not match"
-			logrus.Errorf(errStr)
-			return errors.New(errStr)
-		}
-
-		logrus.Infof("uid: %v, blockmd5: %v, filesize: %v", block.UID, mailText.Vblockmd5, len(b))
-
-		tmpbf, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
-		if err != nil {
-			logrus.Errorf("OpenFile %v, err: %v", tmp, err)
-			return err
-		}
-
-		tmpbf.Write(b)
-		tmpbf.Close()
-
-		err = os.Rename(tmp, cacheBlockPath)
-		if err != nil {
-			logrus.Errorf("rename error %v -> %v, err: %v", tmp, cacheBlockPath, err)
-			return err
-		}
-	}
-
-	tmpf, err := os.OpenFile(saveTmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
-	if err != nil {
-		logrus.Errorf("OpenFile %v, err: %v", saveTmpPath, err)
-		return err
-	}
-
-	for _, block := range f.Blocks {
-		cacheBlockPath := fileCachePath + "/" + strconv.FormatInt(block.BlockSeq, 10)
-		cacheBlock, err := os.OpenFile(cacheBlockPath, os.O_RDONLY, 0644)
-		if err != nil {
-			logrus.Errorf("OpenFile %v, err: %v", cacheBlockPath, err)
-			return err
-		}
-
-		blockdata, err := io.ReadAll(cacheBlock)
-		cacheBlock.Close()
-		if err != nil {
-			logrus.Errorf("read file %v error: %v", cacheBlockPath, err)
-			return err
-		}
-
-		_, err = tmpf.Write(blockdata)
-		if err != nil {
-			logrus.Errorf("write file %v error: %v", saveTmpPath, err)
-			return err
-		}
-	}
-
-	tmpf.Close()
-
-	filemd5, _ := md5File(saveTmpPath)
-	if filemd5 != f.FileMD5 {
-		logrus.Errorf("file %v md5 not match, %v wanna(%v) error", saveTmpPath, filemd5, f.FileMD5)
-		return errors.New("file md5 not match")
-	}
-
-	err = os.Rename(saveTmpPath, savePath)
-	if err != nil {
-		logrus.Errorf("rename error %v -> %v, err: %v", saveTmpPath, savePath, err)
-		return err
-	}
-
-	err = os.RemoveAll(fileCachePath)
-	if err != nil {
-		logrus.Warnf("remove dir %v, err: %v", fileCachePath, err)
-	}
-
-	return nil
-}
-
 func (mailfs *MailFileSystem) UploadFileEach(header *mail.Header, text []byte, fileName string, block []byte) error {
 	return mailfs.withRetry("UploadFileEach/APPEND", func() error {
 		var mailBuf bytes.Buffer
@@ -622,16 +478,17 @@ func (mailfs *MailFileSystem) UploadFileEach(header *mail.Header, text []byte, f
 
 // GenHeader 生成邮件头
 func (mailfs *MailFileSystem) GenHeader(fileName string, fBlockSeq int64, fBlockCount int64, encrypted bool) (*mail.Header, error) {
-	header := mail.Header{}
-	header.SetAddressList("From", []*mail.Address{{
-		Name:    "阳光",
-		Address: "1096693846@qq.com",
-	}})
+	// 从配置和登录凭据获取邮件地址信息
+	emailName := "mailfs"
+	if mailfs.cfg != nil && mailfs.cfg.EmailName != "" {
+		emailName = mailfs.cfg.EmailName
+	}
+	emailAddr := mailfs.usr // 登录用户名即为邮箱地址
 
-	header.SetAddressList("to", []*mail.Address{{
-		Name:    "阳光",
-		Address: "1096693846@qq.com",
-	}})
+	addr := &mail.Address{Name: emailName, Address: emailAddr}
+	header := mail.Header{}
+	header.SetAddressList("From", []*mail.Address{addr})
+	header.SetAddressList("to", []*mail.Address{addr})
 
 	mode := "plain"
 	subjectName := fileName
@@ -648,10 +505,16 @@ func (mailfs *MailFileSystem) GenHeader(fileName string, fBlockSeq int64, fBlock
 }
 
 func (mailfs *MailFileSystem) GetMailboxList() ([]string, error) {
+	// 从配置获取邮箱目录前缀
+	prefix := "其他文件夹/*"
+	if mailfs.cfg != nil && mailfs.cfg.MailboxPrefix != "" {
+		prefix = mailfs.cfg.MailboxPrefix
+	}
+
 	var folders []string
 
 	err := mailfs.withRetry("GetMailboxList/LIST", func() error {
-		listCmd := mailfs.c.List("", "其他文件夹/*", nil)
+		listCmd := mailfs.c.List("", prefix, nil)
 		mboxes, err := listCmd.Collect()
 		if err != nil {
 			logrus.Errorf("IMAP LIST failed: %v", err)

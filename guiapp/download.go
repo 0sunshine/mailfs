@@ -223,7 +223,7 @@ func (p *DownloadPage) Content() fyne.CanvasObject {
 			f := p.pageFiles[row]
 			switch col {
 			case 0:
-				return lastSegment(f.LocalPath)
+				return libfs.LastSegment(f.LocalPath)
 			case 1:
 				return fmt.Sprintf("%d", f.BlockCount)
 			case 2:
@@ -509,7 +509,7 @@ func (p *DownloadPage) showDownloadMenu(f libfs.CacheFile, pos fyne.Position) {
 	if p.win == nil {
 		return
 	}
-	name := lastSegment(f.LocalPath)
+	name := libfs.LastSegment(f.LocalPath)
 	httpURL := buildHTTPStreamURL(f.MailFolder, f.LocalPath)
 	menu := fyne.NewMenu("",
 		fyne.NewMenuItem("⬇  下载  "+name, func() {
@@ -541,7 +541,7 @@ func buildHTTPStreamURL(imapDir, localPath string) string {
 }
 
 func (p *DownloadPage) downloadFile(f libfs.CacheFile) {
-	name := lastSegment(f.LocalPath)
+	name := libfs.LastSegment(f.LocalPath)
 	p.setStatus(fmt.Sprintf("⬇  准备下载: %s", name))
 	p.showBlockProgress(0, f.BlockCount)
 
@@ -707,18 +707,18 @@ func (p *DownloadPage) downloadFolder(nodeID string) {
 	}
 
 	if len(targets) == 0 {
-		p.setStatus(fmt.Sprintf("目录 [%s] 下没有可下载的文件", lastSegment(nodeID)))
+		p.setStatus(fmt.Sprintf("目录 [%s] 下没有可下载的文件", libfs.LastSegment(nodeID)))
 		return
 	}
 
-	dirName := lastSegment(nodeID)
+	dirName := libfs.LastSegment(nodeID)
 	p.setStatus(fmt.Sprintf("⬇  开始下载目录 [%s]，共 %d 个文件…", dirName, len(targets)))
 
 	fs := libfs.NewMailFileSystem()
 	defer fs.Logout()
 
 	for i, f := range targets {
-		name := lastSegment(f.LocalPath)
+		name := libfs.LastSegment(f.LocalPath)
 		p.setStatus(fmt.Sprintf("⬇  [%d/%d] 下载中: %s", i+1, len(targets), name))
 		p.showBlockProgress(0, f.BlockCount)
 
@@ -869,17 +869,6 @@ func normalizePath(lp string) string {
 	lp = strings.ReplaceAll(lp, "\\", "/")
 	lp = strings.TrimLeft(lp, "/")
 	return lp
-}
-
-// lastSegment 取路径最后一段（文件名或目录名）
-func lastSegment(path string) string {
-	path = strings.ReplaceAll(path, "\\", "/")
-	path = strings.TrimRight(path, "/")
-	idx := strings.LastIndex(path, "/")
-	if idx < 0 {
-		return path
-	}
-	return path[idx+1:]
 }
 
 func appendUniq(slice []string, s string) []string {

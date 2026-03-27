@@ -466,7 +466,7 @@ func (s *HTTPIMAPServer) handleStream(w http.ResponseWriter, r *http.Request) {
 
 	cacheCount, cacheMB := s.blockCache.Stats()
 	logrus.Infof("[HTTP] 完成: %s, %d-%d, 缓存: %d块/%dMB",
-		lastSegment(localPath), rangeStart, rangeEnd, cacheCount, cacheMB)
+		LastSegment(localPath), rangeStart, rangeEnd, cacheCount, cacheMB)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -585,16 +585,6 @@ func parseRange(header string, totalSize int64) (int64, int64, bool) {
 // ──────────────────────────────────────────────────────────────────────────────
 // 辅助函数
 // ──────────────────────────────────────────────────────────────────────────────
-
-func lastSegment(path string) string {
-	path = strings.ReplaceAll(path, "\\", "/")
-	path = strings.TrimRight(path, "/")
-	idx := strings.LastIndex(path, "/")
-	if idx < 0 {
-		return path
-	}
-	return path[idx+1:]
-}
 
 func decodeBase64Param(s string) (string, error) {
 	b, err := base64.StdEncoding.DecodeString(s)
