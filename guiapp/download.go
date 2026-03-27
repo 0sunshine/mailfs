@@ -11,6 +11,7 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/driver/desktop"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
@@ -88,10 +89,16 @@ func (p *DownloadPage) Content() fyne.CanvasObject {
 			)
 		},
 		func(i widget.ListItemID, obj fyne.CanvasObject) {
+			if i >= len(p.folders) {
+				return
+			}
 			obj.(*fyne.Container).Objects[1].(*widget.Label).SetText(p.folders[i])
 		},
 	)
 	p.folderList.OnSelected = func(id widget.ListItemID) {
+		if id >= len(p.folders) {
+			return
+		}
 		folder := p.folders[id]
 		p.lastSelFolder = folder
 		go p.selectFolder(folder)
@@ -267,13 +274,13 @@ func (p *DownloadPage) loadFolders() {
 		return
 	}
 	sort.Strings(folders)
-	p.mu.Lock()
-	p.folders = folders
-	p.mu.Unlock()
+	n := len(folders)
+	// 在主线程同步更新数据和刷新，避免竞态
 	fyne.Do(func() {
+		p.folders = folders
 		p.folderList.Refresh()
 	})
-	p.setStatus(fmt.Sprintf("共 %d 个文件夹，请选择", len(folders)))
+	p.setStatus(fmt.Sprintf("共 %d 个文件夹，请选择", n))
 }
 
 func (p *DownloadPage) selectFolder(folder string) {
@@ -429,14 +436,12 @@ func (p *DownloadPage) filterByPath(nodeID string) {
 	all := p.allFiles
 	p.mu.Unlock()
 
+	// 使用前缀匹配，递归显示选中目录下的所有文件
+	prefix := nodeID + "/"
 	var filtered []libfs.CacheFile
 	for _, f := range all {
 		lp := normalizePath(f.LocalPath)
-		dir := ""
-		if idx := strings.LastIndex(lp, "/"); idx >= 0 {
-			dir = lp[:idx]
-		}
-		if dir == nodeID {
+		if strings.HasPrefix(lp, prefix) {
 			filtered = append(filtered, f)
 		}
 	}
@@ -482,18 +487,22 @@ func (p *DownloadPage) applyPage() {
 	if end > len(src) {
 		end = len(src)
 	}
-	p.pageFiles = src[start:end]
+	pageFiles := src[start:end]
+	page := p.currentPage
+	totalPages := p.totalPages
 	p.mu.Unlock()
 
+	// 在主线程同步更新 pageFiles 和刷新表格，避免竞态
 	fyne.Do(func() {
+		p.pageFiles = pageFiles
 		p.fileTable.Refresh()
-		p.pageLabel.SetText(fmt.Sprintf("第 %d / %d 页", p.currentPage, p.totalPages))
-		if p.currentPage <= 1 {
+		p.pageLabel.SetText(fmt.Sprintf("第 %d / %d 页", page, totalPages))
+		if page <= 1 {
 			p.prevBtn.Disable()
 		} else {
 			p.prevBtn.Enable()
 		}
-		if p.currentPage >= p.totalPages {
+		if page >= totalPages {
 			p.nextBtn.Disable()
 		} else {
 			p.nextBtn.Enable()
@@ -615,16 +624,38 @@ func (p *DownloadPage) runIntegrityCheck() {
 	}
 
 	ok, broken := 0, 0
+	var brokenDetails []string
 	for _, r := range results {
 		if r.OK {
 			ok++
 		} else {
 			broken++
+			brokenDetails = append(brokenDetails,
+				fmt.Sprintf("  %s  (缓存 %d/%d 块)",
+					libfs.LastSegment(r.File.LocalPath), r.CachedBlocks, r.ExpectedBlocks))
 		}
 	}
 
+	summary := fmt.Sprintf("完好: %d\n不完整: %d\n共计: %d", ok, broken, len(results))
+	if broken > 0 {
+		limit := len(brokenDetails)
+		if limit > 20 {
+			summary += fmt.Sprintf("\n\n不完整文件（显示前 20 / %d 个）:\n", broken)
+			limit = 20
+		} else {
+			summary += "\n\n不完整文件:\n"
+		}
+		summary += strings.Join(brokenDetails[:limit], "\n")
+	}
+
 	p.setStatus(fmt.Sprintf("完整性检测完成: %d 完好, %d 不完整, 共 %d", ok, broken, len(results)))
-	fyne.Do(func() { p.checkBtn.Enable() })
+
+	fyne.Do(func() {
+		if p.win != nil {
+			dialog.ShowInformation("完整性检测结果", summary, p.win)
+		}
+		p.checkBtn.Enable()
+	})
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -109,10 +109,16 @@ func (p *UploadPage) Content() fyne.CanvasObject {
 			)
 		},
 		func(i widget.ListItemID, obj fyne.CanvasObject) {
+			if i >= len(p.folders) {
+				return
+			}
 			obj.(*fyne.Container).Objects[1].(*widget.Label).SetText(p.folders[i])
 		},
 	)
 	p.folderList.OnSelected = func(id widget.ListItemID) {
+		if id >= len(p.folders) {
+			return
+		}
 		folder := p.folders[id]
 		p.selFolder = folder
 		p.targetLabel.SetText(folder)
@@ -245,11 +251,12 @@ func (p *UploadPage) loadFolders() {
 		return
 	}
 	sort.Strings(folders)
-	p.mu.Lock()
-	p.folders = folders
-	p.mu.Unlock()
-	fyne.Do(func() { p.folderList.Refresh() })
-	p.setStatus(fmt.Sprintf("共 %d 个文件夹，请选择上传目标", len(folders)))
+	n := len(folders)
+	fyne.Do(func() {
+		p.folders = folders
+		p.folderList.Refresh()
+	})
+	p.setStatus(fmt.Sprintf("共 %d 个文件夹，请选择上传目标", n))
 }
 
 // ─── 选择文件/文件夹并上传 ─────────────────────────────────────────────────

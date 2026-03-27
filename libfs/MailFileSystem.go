@@ -505,6 +505,10 @@ func (mailfs *MailFileSystem) GenHeader(fileName string, fBlockSeq int64, fBlock
 }
 
 func (mailfs *MailFileSystem) GetMailboxList() ([]string, error) {
+	if mailfs.c == nil {
+		return nil, errors.New("not login")
+	}
+
 	// 从配置获取邮箱目录前缀
 	prefix := "其他文件夹/*"
 	if mailfs.cfg != nil && mailfs.cfg.MailboxPrefix != "" {
