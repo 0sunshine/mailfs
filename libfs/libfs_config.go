@@ -41,6 +41,10 @@ type AppConfig struct {
 	// 目录上传时忽略的文件后缀（不区分大小写）
 	IgnoreExtensions []string `yaml:"ignore_extensions"`
 
+	// ── 日志配置 ──
+	// 日志输出目标: "console" 输出到控制台, "file" 输出到日志文件, 默认 "console"
+	LogOutput string `yaml:"log_output"`
+
 	// ── 块大小配置 ──
 	// 默认块大小（字节）
 	DefaultBlockSize int64 `yaml:"default_block_size"`
@@ -65,6 +69,7 @@ func defaultConfig() *AppConfig {
 		HTTPCopyAddr:     "http://127.0.0.1:9867",
 		AllowedFolders:   []string{},
 		IgnoreExtensions: []string{},
+		LogOutput:        "console",
 		DefaultBlockSize: DefaultFileBlockSize,
 		BlockSizes:       map[string]int64{},
 	}

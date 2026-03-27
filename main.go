@@ -12,9 +12,7 @@ import (
 
 var logFile *lumberjack.Logger
 
-func init_log() {
-	// Output to stdout instead of the default stderr
-	// Can be any io.Writer, see below for File example
+func init_log(cfg *libfs.AppConfig) {
 	logFile = &lumberjack.Logger{
 		Filename:   "log.txt",
 		MaxSize:    50, // MB
@@ -29,26 +27,27 @@ func init_log() {
 		FullTimestamp: true,
 	})
 
-	logrus.SetOutput(logFile)
-	logrus.SetOutput(os.Stdout)
+	// 根据配置决定日志输出目标
+	if cfg.LogOutput == "file" {
+		logrus.SetOutput(logFile)
+	} else {
+		logrus.SetOutput(os.Stdout)
+	}
 
-	// Only log the warning severity or above.
 	logrus.SetLevel(logrus.DebugLevel)
-
 	logrus.SetReportCaller(true)
 }
 
 func main() {
-	init_log()
+	// 加载统一配置（须在 init_log 之前，因为日志输出目标由配置决定）
+	cfg := libfs.LoadConfig()
+	init_log(cfg)
 	defer func() {
 		err := logFile.Close()
 		if err != nil {
 			fmt.Println(err)
 		}
 	}()
-
-	// 加载统一配置
-	cfg := libfs.LoadConfig()
 
 	// 启动 HTTP-to-IMAP 流媒体服务（后台），使用配置中的监听地址
 	httpServer := libfs.NewHTTPIMAPServer(cfg.HTTPListenAddr)

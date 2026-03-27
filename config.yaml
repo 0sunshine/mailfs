@@ -36,6 +36,9 @@ ignore_extensions:
   - ".bak"
   - ".log"
 
+# 日志输出目标: "console" 输出到控制台, "file" 输出到日志文件
+log_output: "console"
+
 # 默认块大小（字节），不匹配任何后缀规则时使用，默认 32MB
 default_block_size: 33554432
 

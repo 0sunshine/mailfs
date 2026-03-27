@@ -630,9 +630,10 @@ func (p *DownloadPage) runIntegrityCheck() {
 			ok++
 		} else {
 			broken++
+			logrus.Warnf("不完整: %s (缓存 %d/%d 块)", r.File.LocalPath, r.CachedBlocks, r.ExpectedBlocks)
 			brokenDetails = append(brokenDetails,
 				fmt.Sprintf("  %s  (缓存 %d/%d 块)",
-					libfs.LastSegment(r.File.LocalPath), r.CachedBlocks, r.ExpectedBlocks))
+					r.File.LocalPath, r.CachedBlocks, r.ExpectedBlocks))
 		}
 	}
 
