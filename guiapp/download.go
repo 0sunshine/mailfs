@@ -2,6 +2,7 @@ package guiapp
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"mailfs/libfs"
 	"sort"
@@ -37,6 +38,7 @@ type DownloadPage struct {
 	blockLabel  *widget.Label
 	syncBtn     *widget.Button
 	checkBtn    *widget.Button
+	exportBtn   *widget.Button
 	prevBtn     *widget.Button
 	nextBtn     *widget.Button
 	pageLabel   *widget.Label
@@ -178,6 +180,10 @@ func (p *DownloadPage) Content() fyne.CanvasObject {
 		go p.runIntegrityCheck()
 	})
 
+	p.exportBtn = widget.NewButtonWithIcon("导出播放列表", theme.DocumentSaveIcon(), func() {
+		go p.exportPlaylist()
+	})
+
 	p.prevBtn = widget.NewButtonWithIcon("", theme.NavigateBackIcon(), func() {
 		if p.currentPage > 1 {
 			p.currentPage--
@@ -205,6 +211,7 @@ func (p *DownloadPage) Content() fyne.CanvasObject {
 	toolbar := container.NewHBox(
 		p.syncBtn,
 		p.checkBtn,
+		p.exportBtn,
 		widget.NewSeparator(),
 		p.prevBtn,
 		p.pageLabel,
@@ -656,6 +663,102 @@ func (p *DownloadPage) runIntegrityCheck() {
 			dialog.ShowInformation("完整性检测结果", summary, p.win)
 		}
 		p.checkBtn.Enable()
+	})
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 导出播放列表
+// ─────────────────────────────────────────────────────────────────────────────
+
+func (p *DownloadPage) exportPlaylist() {
+	if p.selFolder == "" {
+		p.setStatus("请先选择文件夹")
+		return
+	}
+	fyne.Do(func() { p.exportBtn.Disable() })
+	folder := p.selFolder
+	p.setStatus(fmt.Sprintf("正在从数据库查询 [%s] 的文件…", folder))
+
+	// 直接从 SQLite 查询，不依赖 UI 缓存
+	files, err := libfs.GetCacheFilesByFolder(folder)
+	if err != nil {
+		p.setStatus(fmt.Sprintf("查询数据库失败: %v", err))
+		fyne.Do(func() { p.exportBtn.Enable() })
+		return
+	}
+
+	if len(files) == 0 {
+		p.setStatus("当前文件夹没有文件，请先同步缓存")
+		fyne.Do(func() { p.exportBtn.Enable() })
+		return
+	}
+	p.setStatus(fmt.Sprintf("正在生成播放列表… (%d 个文件)", len(files)))
+
+	// 构建层级树: 每个目录节点是 map[string]interface{}，叶子文件是 url 字符串
+	root := make(map[string]interface{})
+	for _, f := range files {
+		lp := normalizePath(f.LocalPath)
+		if lp == "" {
+			continue
+		}
+		url := buildHTTPStreamURL(folder, f.LocalPath)
+		parts := strings.Split(lp, "/")
+
+		// 沿路径逐层创建/定位目录节点，最后一段是文件名
+		node := root
+		for i := 0; i < len(parts)-1; i++ {
+			dirName := parts[i]
+			if child, ok := node[dirName]; ok {
+				if childMap, ok2 := child.(map[string]interface{}); ok2 {
+					node = childMap
+				} else {
+					// 极端情况：同名既是文件又是目录，跳过
+					break
+				}
+			} else {
+				childMap := make(map[string]interface{})
+				node[dirName] = childMap
+				node = childMap
+			}
+		}
+		fileName := parts[len(parts)-1]
+		node[fileName] = url
+	}
+
+	data, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		p.setStatus(fmt.Sprintf("JSON 序列化失败: %v", err))
+		fyne.Do(func() { p.exportBtn.Enable() })
+		return
+	}
+
+	// 导出文件名: 取文件夹最后一段作为前缀
+	exportName := libfs.LastSegment(folder) + "_playlist.json"
+
+	fyne.Do(func() {
+		dlg := dialog.NewFileSave(func(writer fyne.URIWriteCloser, err error) {
+			if err != nil {
+				p.setStatus(fmt.Sprintf("保存失败: %v", err))
+				p.exportBtn.Enable()
+				return
+			}
+			if writer == nil {
+				// 用户取消
+				p.exportBtn.Enable()
+				return
+			}
+
+			if _, writeErr := writer.Write(data); writeErr != nil {
+				p.setStatus(fmt.Sprintf("写入失败: %v", writeErr))
+			} else {
+				p.setStatus(fmt.Sprintf("已导出播放列表: %s (%d 个文件)", exportName, len(files)))
+				logrus.Infof("导出播放列表到 %s，共 %d 个文件", writer.URI().Path(), len(files))
+			}
+			writer.Close()
+			p.exportBtn.Enable()
+		}, p.win)
+		dlg.SetFileName(exportName)
+		dlg.Show()
 	})
 }
 

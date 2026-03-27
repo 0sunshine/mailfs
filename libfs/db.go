@@ -148,6 +148,11 @@ func cacheToDB(uid imap.UID, m *MailText) error {
 	return nil
 }
 
+// GetCacheFilesByFolder 根据远程目录名直接从数据库查询所有缓存文件（无需 IMAP 连接）。
+func GetCacheFilesByFolder(folder string) ([]CacheFile, error) {
+	return getCacheFileFromDB(folder, "")
+}
+
 func getCacheFileFromDB(remoteDir string, localPath string) ([]CacheFile, error) {
 
 	conds := []sqlCondition{

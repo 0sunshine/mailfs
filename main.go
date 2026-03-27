@@ -54,7 +54,7 @@ func main() {
 	httpServer.StartAsync()
 	logrus.Infof("HTTP streaming server started on %s", cfg.HTTPListenAddr)
 
-	a := app.New()
+	a := app.NewWithID("com.github.mailfs")
 	a.Settings().SetTheme(&MailfsTheme{})
 
 	w := guiapp.NewMainWindow(a)
