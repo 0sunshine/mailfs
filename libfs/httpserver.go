@@ -88,12 +88,27 @@ func (s *HTTPIMAPServer) StartAsync() {
 
 func (s *HTTPIMAPServer) downloadWorker(id int) {
 	logrus.Infof("[Worker %d] 启动", id)
+
+	// 每个 worker 拥有独立的 IMAP 连接，避免并发访问同一连接
+	var fs *MailFileSystem
+
 	for task := range s.taskQueue {
-		s.executeTask(id, task)
+		// 懒初始化 / 重连
+		if fs == nil || fs.c == nil {
+			fs = NewMailFileSystem()
+			if fs.c == nil {
+				logrus.Errorf("[Worker %d] IMAP 登录失败，跳过任务", id)
+				key := blockCacheKey(task.imapDir, task.uid)
+				s.finishWaiter(key, fmt.Errorf("worker %d: IMAP login failed", id))
+				continue
+			}
+			logrus.Infof("[Worker %d] IMAP 连接已建立", id)
+		}
+		s.executeTask(id, task, fs)
 	}
 }
 
-func (s *HTTPIMAPServer) executeTask(workerID int, task *downloadTask) {
+func (s *HTTPIMAPServer) executeTask(workerID int, task *downloadTask, fs *MailFileSystem) {
 	key := blockCacheKey(task.imapDir, task.uid)
 
 	if _, _, hit := s.blockCache.Get(task.imapDir, task.uid); hit {
@@ -108,16 +123,27 @@ func (s *HTTPIMAPServer) executeTask(workerID int, task *downloadTask) {
 		return
 	}
 
+	// 确保进入正确的 IMAP 目录
+	if fs.remoteDir != task.imapDir {
+		if err := fs.Enter(task.imapDir); err != nil {
+			logrus.Errorf("[Worker %d] 进入目录失败: %v，重置连接", workerID, err)
+			fs.safeLogout()
+			s.finishWaiter(key, err)
+			return
+		}
+	}
+
 	logrus.Debugf("[Worker %d] 开始下载: %s", workerID, key)
 
-	mt, data, err := downloadUIDForHTTP(task.imapDir, task.uid)
+	mt, data, err := fs.downloadUID(task.uid)
 	if err != nil {
 		if s.allWaitersCancelled(key) {
 			logrus.Debugf("[Worker %d] 下载出错但所有等待者已断开: %s", workerID, key)
 			s.finishWaiter(key, context.Canceled)
 			return
 		}
-		logrus.Errorf("[Worker %d] 下载失败: %s — %v", workerID, key, err)
+		logrus.Errorf("[Worker %d] 下载失败: %s — %v，重置连接", workerID, key, err)
+		fs.safeLogout()
 		s.finishWaiter(key, err)
 		return
 	}
@@ -469,62 +495,6 @@ func (s *HTTPIMAPServer) handleStream(w http.ResponseWriter, r *http.Request) {
 		LastSegment(localPath), rangeStart, rangeEnd, cacheCount, cacheMB)
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// IMAP 连接管理
-// ──────────────────────────────────────────────────────────────────────────────
-
-var (
-	httpFS   *MailFileSystem
-	httpFSMu sync.Mutex
-)
-
-func getHTTPMailFS() (*MailFileSystem, error) {
-	httpFSMu.Lock()
-	defer httpFSMu.Unlock()
-
-	if httpFS != nil && httpFS.c != nil {
-		return httpFS, nil
-	}
-
-	httpFS = NewMailFileSystem()
-	if httpFS.c == nil {
-		return nil, fmt.Errorf("HTTP IMAP login failed")
-	}
-	return httpFS, nil
-}
-
-func downloadUIDForHTTP(imapDir string, uid int64) (*MailText, []byte, error) {
-	fs, err := getHTTPMailFS()
-	if err != nil {
-		return nil, nil, err
-	}
-
-	httpFSMu.Lock()
-	if fs.remoteDir != imapDir {
-		if err := fs.Enter(imapDir); err != nil {
-			httpFSMu.Unlock()
-			resetHTTPFS()
-			return nil, nil, fmt.Errorf("enter dir failed: %w", err)
-		}
-	}
-	httpFSMu.Unlock()
-
-	mailText, data, err := fs.downloadUID(uid)
-	if err != nil {
-		resetHTTPFS()
-		return nil, nil, err
-	}
-	return mailText, data, nil
-}
-
-func resetHTTPFS() {
-	httpFSMu.Lock()
-	defer httpFSMu.Unlock()
-	if httpFS != nil {
-		httpFS.Logout()
-		httpFS = nil
-	}
-}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Range 解析
