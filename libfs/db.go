@@ -108,40 +108,21 @@ func cacheToDB(uid imap.UID, m *MailText) error {
 		return err
 	}
 
-	var fileid int64
+	// 并发安全：先尝试插入（忽略重复），再查询 fileid
+	db.Exec(`INSERT OR IGNORE INTO cache_files (mailfolder, localpath, blockcount, filemd5, filesize)
+		VALUES (?,?,?,?,?);`, m.Vmailfolder, m.Vlocalpath, blockcount, m.Vfilemd5, m.Vfilesize)
 
-	rows, err := db.Query(`SELECT fileid FROM cache_files WHERE mailfolder=? AND localpath=?;`, m.Vmailfolder, m.Vlocalpath)
+	var fileid int64
+	err = db.QueryRow(`SELECT fileid FROM cache_files WHERE mailfolder=? AND localpath=?;`,
+		m.Vmailfolder, m.Vlocalpath).Scan(&fileid)
 	if err != nil {
-		logrus.Errorf("sql error: %v", err)
+		logrus.Errorf("查询 fileid 失败: %v", err)
 		return err
 	}
 
-	if rows.Next() {
-		if err := rows.Scan(&fileid); err != nil {
-			logrus.Errorf("rows.Scan(&fileid) error: %v", err)
-			return err
-		}
-	}
-	rows.Close()
-
-	if fileid <= 0 {
-		r, err := db.Exec(`INSERT INTO cache_files (mailfolder, localpath, blockcount, filemd5, filesize) 
-										  VALUES (?,?,?,?,?);`, m.Vmailfolder, m.Vlocalpath, blockcount, m.Vfilemd5, m.Vfilesize)
-		if err != nil {
-			logrus.Errorf("sql error: %v", err)
-			return err
-		}
-
-		fileid, err = r.LastInsertId()
-		if err != nil {
-			logrus.Errorf("LastInsertId error: %v", err)
-			return err
-		}
-	} else {
-		// 更新 filesize（兼容旧数据）
-		if m.Vfilesize > 0 {
-			db.Exec(`UPDATE cache_files SET filesize=? WHERE fileid=? AND filesize=0;`, m.Vfilesize, fileid)
-		}
+	// 更新 filesize（兼容旧数据）
+	if m.Vfilesize > 0 {
+		db.Exec(`UPDATE cache_files SET filesize=? WHERE fileid=? AND filesize=0;`, m.Vfilesize, fileid)
 	}
 
 	_, err = db.Exec(`INSERT OR REPLACE INTO cache_blocks (fileid, blockseq, uid, blockmd5, blocksize) 
