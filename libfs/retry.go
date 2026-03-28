@@ -12,9 +12,30 @@ const maxRetries = 10
 
 // 各阶段超时
 const (
-	logoutTimeout  = 5 * time.Second  // Logout 最多等 5 秒
-	maxBackoff     = 60 * time.Second // 退避上限
+	logoutTimeout  = 5 * time.Second   // Logout 最多等 5 秒
+	maxBackoff     = 60 * time.Second  // 退避上限
+	imapOpTimeout  = 120 * time.Second // 单次 IMAP 操作超时（APPEND/FETCH/SELECT 等）
 )
+
+// imapDoTimeout 在超时内执行 IMAP 阻塞操作。
+// 若超时，强制关闭底层连接以解除阻塞，返回 timeout 错误（触发 withRetry 重连）。
+func (mailfs *MailFileSystem) imapDoTimeout(op string, fn func() error) error {
+	done := make(chan error, 1)
+	go func() {
+		done <- fn()
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(imapOpTimeout):
+		logrus.Errorf("[超时] %s 超过 %v 未响应，强制关闭连接", op, imapOpTimeout)
+		if mailfs.c != nil {
+			_ = mailfs.c.Close()
+		}
+		return fmt.Errorf("%s: IMAP operation timeout after %v", op, imapOpTimeout)
+	}
+}
 
 // isNetworkError 判断是否为网络相关错误（IMAP 连接断开、超时、EOF 等）
 func isNetworkError(err error) bool {
