@@ -40,7 +40,6 @@ func (mailfs *MailFileSystem) UploadFileWithProgress(path string, blockCb BlockP
 
 	logrus.Infof("remote: %v, upload file: %v", mailfs.remoteDir, path)
 
-	// 根据远程邮箱目录判断是否需要加密
 	encrypted := NeedEncryptByRemoteDir(mailfs.remoteDir)
 	if encrypted {
 		logrus.Infof("远程目录以.开头，将对文件路径信息进行加密上传: remoteDir=%v, file=%v", mailfs.remoteDir, path)
@@ -85,7 +84,6 @@ func (mailfs *MailFileSystem) UploadFileWithProgress(path string, blockCb BlockP
 		return err
 	}
 
-	// 根据文件后缀从配置获取块大小
 	fileName := filepath.Base(path)
 	blockSize := GetBlockSizeForFile(fileName)
 	logrus.Infof("文件 %s 使用块大小: %dMB", fileName, blockSize/(1024*1024))
@@ -127,28 +125,26 @@ func (mailfs *MailFileSystem) UploadFileWithProgress(path string, blockCb BlockP
 			return err
 		}
 
-		// 构造邮件正文：加密时对 localpath 加密
 		localPathForMail := path
 		if encrypted {
 			localPathForMail = Encrypt(path)
 		}
 
 		mailText := MailText{
-			Vfilemd5:    filemd5,
-			Vblockmd5:   blockmd5,
-			Vfilesize:   fSize,
-			Vblocksize:  int64(len(fileBlock)),
-			Vcreatetime: time.Now(),
-			Vowner:      "sunshine",
-			Vlocalpath:  localPathForMail,
-			Vmailfolder: mailfs.remoteDir,
+			FileMD5:    filemd5,
+			BlockMD5:   blockmd5,
+			FileSize:   fSize,
+			BlockSize:  int64(len(fileBlock)),
+			CreateTime: time.Now(),
+			Owner:      "sunshine",
+			LocalPath:  localPathForMail,
+			MailFolder: mailfs.remoteDir,
 		}
-		mailText.Vsubject, err = header.Subject()
+		mailText.Subject, err = header.Subject()
 		if err != nil {
 			return err
 		}
 
-		// 附件名也加密
 		attachName := fileName
 		if encrypted {
 			attachName = Encrypt(fileName)
@@ -300,10 +296,10 @@ func (mailfs *MailFileSystem) DownloadCacheFileWithProgress(f CacheFile, blockCb
 		if block.BlockMD5 != blockmd5 {
 			return errors.New("block md5 not match")
 		}
-		if mailText.Vmailfolder != f.MailFolder {
+		if mailText.MailFolder != f.MailFolder {
 			return errors.New("mailfolder not match")
 		}
-		if mailText.Vlocalpath != f.LocalPath {
+		if mailText.LocalPath != f.LocalPath {
 			return errors.New("localpath not match")
 		}
 
@@ -359,38 +355,4 @@ func (mailfs *MailFileSystem) DownloadCacheFileWithProgress(f CacheFile, blockCb
 
 	os.RemoveAll(fileCachePath)
 	return nil
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// CheckIntegrity — 检查文件完整性
-// ──────────────────────────────────────────────────────────────────────────────
-
-type IntegrityResult struct {
-	File           CacheFile
-	CachedBlocks   int64
-	ExpectedBlocks int64
-	OK             bool
-}
-
-func CheckIntegrity(folder string) ([]IntegrityResult, error) {
-	files, err := getCacheFileFromDB(folder, "")
-	if err != nil {
-		return nil, err
-	}
-
-	results := make([]IntegrityResult, 0, len(files))
-	for _, f := range files {
-		blocks, err := getCacheBlockFromDB(f.FileID)
-		if err != nil {
-			return nil, err
-		}
-		r := IntegrityResult{
-			File:           f,
-			CachedBlocks:   int64(len(blocks)),
-			ExpectedBlocks: f.BlockCount,
-			OK:             int64(len(blocks)) == f.BlockCount,
-		}
-		results = append(results, r)
-	}
-	return results, nil
 }

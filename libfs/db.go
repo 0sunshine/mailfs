@@ -2,7 +2,6 @@ package libfs
 
 import (
 	"database/sql"
-	_ "database/sql"
 	"errors"
 	"github.com/emersion/go-imap/v2"
 	"github.com/sirupsen/logrus"
@@ -75,7 +74,7 @@ func dbOpen() error {
 		return err
 	}
 
-	// ── 自动迁移：为已有表添加新字段（忽略"已存在"错误）──
+	// 自动迁移：为已有表添加新字段（忽略"已存在"错误）
 	db.Exec(`ALTER TABLE cache_files ADD COLUMN filesize INTEGER NOT NULL DEFAULT 0;`)
 	db.Exec(`ALTER TABLE cache_blocks ADD COLUMN blocksize INTEGER NOT NULL DEFAULT 0;`)
 
@@ -84,7 +83,7 @@ func dbOpen() error {
 
 func cacheToDB(uid imap.UID, m *MailText) error {
 
-	s := strings.Split(m.Vsubject, "/")
+	s := strings.Split(m.Subject, "/")
 	if len(s) < 3 {
 		logrus.Errorf("subject error")
 		return errors.New("subject error")
@@ -110,23 +109,23 @@ func cacheToDB(uid imap.UID, m *MailText) error {
 
 	// 并发安全：先尝试插入（忽略重复），再查询 fileid
 	db.Exec(`INSERT OR IGNORE INTO cache_files (mailfolder, localpath, blockcount, filemd5, filesize)
-		VALUES (?,?,?,?,?);`, m.Vmailfolder, m.Vlocalpath, blockcount, m.Vfilemd5, m.Vfilesize)
+		VALUES (?,?,?,?,?);`, m.MailFolder, m.LocalPath, blockcount, m.FileMD5, m.FileSize)
 
 	var fileid int64
 	err = db.QueryRow(`SELECT fileid FROM cache_files WHERE mailfolder=? AND localpath=?;`,
-		m.Vmailfolder, m.Vlocalpath).Scan(&fileid)
+		m.MailFolder, m.LocalPath).Scan(&fileid)
 	if err != nil {
 		logrus.Errorf("查询 fileid 失败: %v", err)
 		return err
 	}
 
 	// 更新 filesize（兼容旧数据）
-	if m.Vfilesize > 0 {
-		db.Exec(`UPDATE cache_files SET filesize=? WHERE fileid=? AND filesize=0;`, m.Vfilesize, fileid)
+	if m.FileSize > 0 {
+		db.Exec(`UPDATE cache_files SET filesize=? WHERE fileid=? AND filesize=0;`, m.FileSize, fileid)
 	}
 
-	_, err = db.Exec(`INSERT OR REPLACE INTO cache_blocks (fileid, blockseq, uid, blockmd5, blocksize) 
-										  VALUES (?,?,?,?,?);`, fileid, blockseq, int32(uid), m.Vblockmd5, m.Vblocksize)
+	_, err = db.Exec(`INSERT OR REPLACE INTO cache_blocks (fileid, blockseq, uid, blockmd5, blocksize)
+								  VALUES (?,?,?,?,?);`, fileid, blockseq, int64(uid), m.BlockMD5, m.BlockSize)
 	if err != nil {
 		logrus.Errorf("sql error: %v", err)
 		return err
@@ -196,22 +195,6 @@ func getCacheBlockFromDB(fileid int64) ([]CacheBlock, error) {
 	}
 
 	return blocks, nil
-}
-
-func isUIDCached(remoteDir string, uid int64) (bool, error) {
-	rows, err := db.Query(`SELECT 1 FROM cache_blocks a INNER JOIN cache_files b
-         ON a.fileid=b.fileid WHERE a.uid=? and b.mailfolder=?;`, uid, remoteDir)
-	if err != nil {
-		logrus.Errorf("sql error: %v", err)
-		return false, err
-	}
-	defer rows.Close()
-
-	if rows.Next() {
-		return true, nil
-	}
-
-	return false, nil
 }
 
 // getCachedUIDSet 一次性加载指定目录下所有已缓存的 UID 到内存 set，避免逐条查询。

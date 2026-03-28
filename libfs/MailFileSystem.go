@@ -7,12 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"mime/quotedprintable"
 	"net"
 	"os"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/emersion/go-imap/v2"
@@ -23,6 +20,10 @@ import (
 
 // 连接超时
 const dialTimeout = 15 * time.Second
+
+// ──────────────────────────────────────────────────────────────────────────────
+// MailFileSystem — IMAP 邮箱文件系统核心结构
+// ──────────────────────────────────────────────────────────────────────────────
 
 type MailFileSystem struct {
 	c               *imapclient.Client
@@ -72,20 +73,21 @@ func NewMailFileSystem() *MailFileSystem {
 	return fs
 }
 
-// Login 带超时的登录：手动 TCP 拨号 + TLS 握手 + IMAP 登录，
-// 防止网络异常时 DialTLS 无限阻塞。
+// ──────────────────────────────────────────────────────────────────────────────
+// 连接管理: Login / Logout / Enter
+// ──────────────────────────────────────────────────────────────────────────────
+
+// Login 带超时的登录：手动 TCP 拨号 + TLS 握手 + IMAP 登录
 func (mailfs *MailFileSystem) Login(usr string, pwd string) error {
-	// 从配置获取 IMAP 服务器地址
 	server := "imap.qq.com:993"
 	if mailfs.cfg != nil && mailfs.cfg.IMAPServer != "" {
 		server = mailfs.cfg.IMAPServer
 	}
 	host, _, err := net.SplitHostPort(server)
 	if err != nil {
-		host = server // 无端口时整体作为主机名
+		host = server
 	}
 
-	// ── 1. 带超时的 TCP 拨号 ──
 	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer cancel()
 
@@ -96,7 +98,6 @@ func (mailfs *MailFileSystem) Login(usr string, pwd string) error {
 		return fmt.Errorf("TCP 拨号失败: %w", err)
 	}
 
-	// ── 2. 带超时的 TLS 握手 ──
 	tlsConn := tls.Client(conn, &tls.Config{ServerName: host})
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		conn.Close()
@@ -104,15 +105,8 @@ func (mailfs *MailFileSystem) Login(usr string, pwd string) error {
 		return fmt.Errorf("TLS 握手失败: %w", err)
 	}
 
-	// ── 3. 在已建立的 TLS 连接上创建 IMAP 客户端 ──
 	c := imapclient.New(tlsConn, nil)
-	if err != nil {
-		tlsConn.Close()
-		logrus.Errorf("创建 IMAP client 失败: %v", err)
-		return fmt.Errorf("创建 IMAP client 失败: %w", err)
-	}
 
-	// ── 4. IMAP LOGIN ──
 	if err = c.Login(usr, pwd).Wait(); err != nil {
 		c.Close()
 		logrus.Errorf("IMAP 登录失败: %v", err)
@@ -128,240 +122,6 @@ func (mailfs *MailFileSystem) Login(usr string, pwd string) error {
 
 func (mailfs *MailFileSystem) Logout() {
 	mailfs.safeLogout()
-}
-
-func (mailfs *MailFileSystem) cacheUID(uids []imap.UID) error {
-
-	logrus.Debugf("cacheUID : %v", uids)
-
-	var mailText *MailText
-	var msgUID imap.UID
-	var messages []*imapclient.FetchMessageBuffer
-	bodySection := &imap.FetchItemBodySection{Part: []int{1}}
-
-	err := mailfs.withRetry("cacheUID/FETCH", func() error {
-		uidSeqSet := imap.UIDSetNum(uids...)
-
-		fetchOptions := &imap.FetchOptions{
-			UID:         true,
-			BodySection: []*imap.FetchItemBodySection{bodySection},
-		}
-
-		logrus.Debugf("FETCH begin...")
-
-		return mailfs.imapDoTimeout("cacheUID/FETCH", func() error {
-			var err error
-			messages, err = mailfs.c.Fetch(uidSeqSet, fetchOptions).Collect()
-			if err != nil {
-				logrus.Errorf("FETCH command failed: %v", err)
-				return err
-			}
-
-			if len(messages) <= 0 {
-				logrus.Errorf("len(messages) <= 0")
-				return errors.New("len(messages) <= 0")
-			}
-
-			logrus.Debugf("FETCH end...")
-			return nil
-		})
-	})
-
-	if err != nil {
-		return err
-	}
-
-	for _, msg := range messages {
-		header := msg.FindBodySection(bodySection)
-		r := quotedprintable.NewReader(bytes.NewReader(header))
-		b, err := io.ReadAll(r)
-		if err != nil {
-			logrus.Errorf("io.ReadAll failed: %v", err)
-			return err
-		}
-
-		mailText = MailTextFromByte(string(b))
-		msgUID = msg.UID
-
-		// 如果是加密邮件，解密 localpath 和 subject
-		// 数据库中存储解密后的真实路径
-		if IsEncryptedSubject(mailText.Vsubject) {
-			mailText.Vlocalpath = Decrypt(mailText.Vlocalpath)
-			mailText.Vsubject = DecryptSubject(mailText.Vsubject)
-		}
-
-		if len(mailText.Vsubject) == 0 || len(mailText.Vlocalpath) == 0 {
-			logrus.Warnf("not a mailfs: %v, uid: %v", mailText.Vsubject, msgUID)
-			return nil
-		}
-
-		err = cacheToDB(msgUID, mailText)
-		if err != nil {
-			logrus.Errorf("cacheToDB failed: %v", err)
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (mailfs *MailFileSystem) CacheCurrDir() error {
-	return mailfs.CacheCurrDirWithProgress(nil)
-}
-
-// CacheProgressFunc 同步缓存进度回调: (已完成UID数, 总UID数)
-type CacheProgressFunc func(done, total int)
-
-func (mailfs *MailFileSystem) CacheCurrDirWithProgress(progressCb CacheProgressFunc) error {
-	if mailfs.c == nil {
-		return errors.New("not login")
-	}
-
-	if len(mailfs.remoteDir) <= 0 {
-		return errors.New("not select dir")
-	}
-
-	var allUIDs []imap.UID
-	err := mailfs.withRetry("CacheCurrDir/SEARCH", func() error {
-		return mailfs.imapDoTimeout("UIDSearch/Wait", func() error {
-			uids, err := mailfs.c.UIDSearch(&imap.SearchCriteria{
-				Header: []imap.SearchCriteriaHeaderField{},
-			}, nil).Wait()
-			if err != nil {
-				logrus.Errorf("UID SEARCH command failed: %v", err)
-				return err
-			}
-			allUIDs = uids.AllUIDs()
-			return nil
-		})
-	})
-	if err != nil {
-		return err
-	}
-
-	total := len(allUIDs)
-	logrus.Infof("UID SEARCH 返回 %d 个 UID", total)
-
-	if progressCb != nil {
-		progressCb(0, total)
-	}
-
-	// 一次性批量加载已缓存 UID 集合，替代逐条查询
-	cachedSet, err := getCachedUIDSet(mailfs.remoteDir)
-	if err != nil {
-		return err
-	}
-	logrus.Infof("已缓存 %d 个 UID，开始筛选未缓存…", len(cachedSet))
-
-	// 筛选未缓存的 UID
-	var uncachedUIDs []imap.UID
-	for _, uid := range allUIDs {
-		if cachedSet[int64(uid)] {
-			continue
-		}
-		uncachedUIDs = append(uncachedUIDs, uid)
-	}
-
-	cachedCount := total - len(uncachedUIDs)
-	logrus.Infof("跳过 %d 个已缓存，需处理 %d 个未缓存", cachedCount, len(uncachedUIDs))
-
-	if len(uncachedUIDs) == 0 {
-		if progressCb != nil {
-			progressCb(total, total)
-		}
-		return nil
-	}
-
-	// 分批，每批最多 32 个 UID
-	const batchSize = 32
-	var batches [][]imap.UID
-	for i := 0; i < len(uncachedUIDs); i += batchSize {
-		end := i + batchSize
-		if end > len(uncachedUIDs) {
-			end = len(uncachedUIDs)
-		}
-		batches = append(batches, uncachedUIDs[i:end])
-	}
-
-	// 创建 worker 连接（共 3 个协程：主连接 + 2 个额外连接）
-	const workerCount = 3
-	workers := make([]*MailFileSystem, workerCount)
-	workers[0] = mailfs
-	actualWorkers := 1
-	for i := 1; i < workerCount; i++ {
-		w := &MailFileSystem{cfg: mailfs.cfg}
-		if err := w.Login(mailfs.usr, mailfs.pwd); err != nil {
-			logrus.Warnf("worker %d 登录失败: %v，使用较少并发", i, err)
-			break
-		}
-		if err := w.Enter(mailfs.remoteDir); err != nil {
-			logrus.Warnf("worker %d 进入目录失败: %v，使用较少并发", i, err)
-			w.safeLogout()
-			break
-		}
-		workers[i] = w
-		actualWorkers++
-	}
-	logrus.Infof("缓存同步使用 %d 个并发连接，共 %d 批", actualWorkers, len(batches))
-
-	// 确保额外 worker 连接被清理
-	defer func() {
-		for i := 1; i < actualWorkers; i++ {
-			if workers[i] != nil {
-				workers[i].safeLogout()
-			}
-		}
-	}()
-
-	// 分发批次到 channel
-	batchCh := make(chan []imap.UID, len(batches))
-	for _, batch := range batches {
-		batchCh <- batch
-	}
-	close(batchCh)
-
-	// 多协程并发处理
-	var (
-		processed int64
-		mu        sync.Mutex
-		firstErr  error
-		wg        sync.WaitGroup
-	)
-
-	for i := 0; i < actualWorkers; i++ {
-		wg.Add(1)
-		go func(w *MailFileSystem) {
-			defer wg.Done()
-			for batch := range batchCh {
-				// 检查是否有其他 worker 已失败
-				mu.Lock()
-				failed := firstErr != nil
-				mu.Unlock()
-				if failed {
-					return
-				}
-
-				if err := w.cacheUID(batch); err != nil {
-					logrus.Errorf("cacheUID failed: %v", err)
-					mu.Lock()
-					if firstErr == nil {
-						firstErr = err
-					}
-					mu.Unlock()
-					return
-				}
-
-				n := atomic.AddInt64(&processed, int64(len(batch)))
-				if progressCb != nil {
-					progressCb(cachedCount+int(n), total)
-				}
-			}
-		}(workers[i])
-	}
-
-	wg.Wait()
-
-	return firstErr
 }
 
 func (mailfs *MailFileSystem) Enter(remoteDir string) error {
@@ -387,38 +147,9 @@ func (mailfs *MailFileSystem) Enter(remoteDir string) error {
 	return nil
 }
 
-func (mailfs *MailFileSystem) SetDownloadRootDir(dir string) error {
-
-	fileInfo, err := os.Stat(dir)
-	if err != nil {
-		logrus.Errorf("SetDownloadRootDir error: %v", err)
-		return err
-	}
-
-	if !fileInfo.IsDir() {
-		logrus.Errorf("not a dir: %v", dir)
-		return errors.New("not a dir")
-	}
-
-	mailfs.downloadRootDir = dir
-	if mailfs.downloadRootDir[len(mailfs.downloadRootDir)-1] != '/' {
-		mailfs.downloadRootDir = mailfs.downloadRootDir + "/"
-	}
-
-	return nil
-}
-
-func (mailfs *MailFileSystem) GetCacheFiles() ([]CacheFile, error) {
-	if mailfs.c == nil {
-		return nil, errors.New("not login")
-	}
-
-	if len(mailfs.remoteDir) <= 0 {
-		return nil, errors.New("not select dir")
-	}
-
-	return getCacheFileFromDB(mailfs.remoteDir, "")
-}
+// ──────────────────────────────────────────────────────────────────────────────
+// 下载 / 上传
+// ──────────────────────────────────────────────────────────────────────────────
 
 func (mailfs *MailFileSystem) downloadUID(uid int64) (*MailText, []byte, error) {
 	logrus.Debugf("downloadUID : %v", uid)
@@ -502,8 +233,8 @@ func (mailfs *MailFileSystem) downloadUID(uid int64) (*MailText, []byte, error) 
 				return errors.New("parse mail error")
 			}
 
-			if len(mailText.Vsubject) == 0 || len(mailText.Vlocalpath) == 0 {
-				errStr := fmt.Sprintf("not a mailfs: %v, uid: %v", mailText.Vsubject, uid)
+			if len(mailText.Subject) == 0 || len(mailText.LocalPath) == 0 {
+				errStr := fmt.Sprintf("not a mailfs: %v, uid: %v", mailText.Subject, uid)
 				logrus.Error(errStr)
 				return errors.New(errStr)
 			}
@@ -513,9 +244,9 @@ func (mailfs *MailFileSystem) downloadUID(uid int64) (*MailText, []byte, error) 
 	})
 
 	// 下载时如果是加密邮件，解密路径信息
-	if err == nil && mailText != nil && IsEncryptedSubject(mailText.Vsubject) {
-		mailText.Vlocalpath = Decrypt(mailText.Vlocalpath)
-		mailText.Vsubject = DecryptSubject(mailText.Vsubject)
+	if err == nil && mailText != nil && IsEncryptedSubject(mailText.Subject) {
+		mailText.LocalPath = Decrypt(mailText.LocalPath)
+		mailText.Subject = DecryptSubject(mailText.Subject)
 	}
 
 	return mailText, fileData, err
@@ -563,7 +294,6 @@ func (mailfs *MailFileSystem) UploadFileEach(header *mail.Header, text []byte, f
 			return err
 		}
 
-		// appendCmd.Wait() 可能永远阻塞，必须加超时保护
 		return mailfs.imapDoTimeout("APPEND/Wait", func() error {
 			appendData, err := appendCmd.Wait()
 			if err != nil {
@@ -577,12 +307,11 @@ func (mailfs *MailFileSystem) UploadFileEach(header *mail.Header, text []byte, f
 
 // GenHeader 生成邮件头
 func (mailfs *MailFileSystem) GenHeader(fileName string, fBlockSeq int64, fBlockCount int64, encrypted bool) (*mail.Header, error) {
-	// 从配置和登录凭据获取邮件地址信息
 	emailName := "mailfs"
 	if mailfs.cfg != nil && mailfs.cfg.EmailName != "" {
 		emailName = mailfs.cfg.EmailName
 	}
-	emailAddr := mailfs.usr // 登录用户名即为邮箱地址
+	emailAddr := mailfs.usr
 
 	addr := &mail.Address{Name: emailName, Address: emailAddr}
 	header := mail.Header{}
@@ -603,12 +332,47 @@ func (mailfs *MailFileSystem) GenHeader(fileName string, fBlockSeq int64, fBlock
 	return &header, nil
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// 查询
+// ──────────────────────────────────────────────────────────────────────────────
+
+func (mailfs *MailFileSystem) SetDownloadRootDir(dir string) error {
+	fileInfo, err := os.Stat(dir)
+	if err != nil {
+		logrus.Errorf("SetDownloadRootDir error: %v", err)
+		return err
+	}
+
+	if !fileInfo.IsDir() {
+		logrus.Errorf("not a dir: %v", dir)
+		return errors.New("not a dir")
+	}
+
+	mailfs.downloadRootDir = dir
+	if mailfs.downloadRootDir[len(mailfs.downloadRootDir)-1] != '/' {
+		mailfs.downloadRootDir = mailfs.downloadRootDir + "/"
+	}
+
+	return nil
+}
+
+func (mailfs *MailFileSystem) GetCacheFiles() ([]CacheFile, error) {
+	if mailfs.c == nil {
+		return nil, errors.New("not login")
+	}
+
+	if len(mailfs.remoteDir) <= 0 {
+		return nil, errors.New("not select dir")
+	}
+
+	return getCacheFileFromDB(mailfs.remoteDir, "")
+}
+
 func (mailfs *MailFileSystem) GetMailboxList() ([]string, error) {
 	if mailfs.c == nil {
 		return nil, errors.New("not login")
 	}
 
-	// 从配置获取邮箱目录前缀
 	prefix := "其他文件夹/*"
 	if mailfs.cfg != nil && mailfs.cfg.MailboxPrefix != "" {
 		prefix = mailfs.cfg.MailboxPrefix
@@ -637,7 +401,6 @@ func (mailfs *MailFileSystem) GetMailboxList() ([]string, error) {
 		return folders, err
 	}
 
-	// 根据配置文件过滤目录列表
 	allowed := LoadAllowedFolders()
 	folders = FilterFolders(folders, allowed)
 

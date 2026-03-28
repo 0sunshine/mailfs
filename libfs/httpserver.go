@@ -386,7 +386,7 @@ func (s *HTTPIMAPServer) handleStream(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		totalSize = mailText.Vfilesize
+		totalSize = mailText.FileSize
 		if totalSize <= 0 {
 			// 最后手段：用块偏移表估算
 			offsets := buildBlockOffsets(cf.Blocks, 0)
@@ -494,7 +494,6 @@ func (s *HTTPIMAPServer) handleStream(w http.ResponseWriter, r *http.Request) {
 	logrus.Infof("[HTTP] 完成: %s, %d-%d, 缓存: %d块/%dMB",
 		LastSegment(localPath), rangeStart, rangeEnd, cacheCount, cacheMB)
 }
-
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Range 解析
