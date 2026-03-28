@@ -69,6 +69,12 @@ func dbOpen() error {
 		return err
 	}
 
+	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS idx_cache_files_mailfolder ON cache_files(mailfolder);`)
+	if err != nil {
+		logrus.Errorf("create index idx_cache_files_mailfolder error")
+		return err
+	}
+
 	// ── 自动迁移：为已有表添加新字段（忽略"已存在"错误）──
 	db.Exec(`ALTER TABLE cache_files ADD COLUMN filesize INTEGER NOT NULL DEFAULT 0;`)
 	db.Exec(`ALTER TABLE cache_blocks ADD COLUMN blocksize INTEGER NOT NULL DEFAULT 0;`)
@@ -212,7 +218,7 @@ func getCacheBlockFromDB(fileid int64) ([]CacheBlock, error) {
 }
 
 func isUIDCached(remoteDir string, uid int64) (bool, error) {
-	rows, err := db.Query(`SELECT 1 FROM cache_blocks a INNER JOIN cache_files b 
+	rows, err := db.Query(`SELECT 1 FROM cache_blocks a INNER JOIN cache_files b
          ON a.fileid=b.fileid WHERE a.uid=? and b.mailfolder=?;`, uid, remoteDir)
 	if err != nil {
 		logrus.Errorf("sql error: %v", err)
@@ -225,4 +231,25 @@ func isUIDCached(remoteDir string, uid int64) (bool, error) {
 	}
 
 	return false, nil
+}
+
+// getCachedUIDSet 一次性加载指定目录下所有已缓存的 UID 到内存 set，避免逐条查询。
+func getCachedUIDSet(remoteDir string) (map[int64]bool, error) {
+	rows, err := db.Query(`SELECT a.uid FROM cache_blocks a INNER JOIN cache_files b
+		ON a.fileid=b.fileid WHERE b.mailfolder=?;`, remoteDir)
+	if err != nil {
+		logrus.Errorf("getCachedUIDSet sql error: %v", err)
+		return nil, err
+	}
+	defer rows.Close()
+
+	set := make(map[int64]bool, 4096)
+	for rows.Next() {
+		var uid int64
+		if err := rows.Scan(&uid); err != nil {
+			return nil, err
+		}
+		set[uid] = true
+	}
+	return set, nil
 }

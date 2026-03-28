@@ -11,6 +11,8 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/emersion/go-imap/v2"
@@ -237,46 +239,129 @@ func (mailfs *MailFileSystem) CacheCurrDirWithProgress(progressCb CacheProgressF
 		return err
 	}
 
-	logrus.Infof("UID has: %v", allUIDs)
-
 	total := len(allUIDs)
+	logrus.Infof("UID SEARCH 返回 %d 个 UID", total)
+
 	if progressCb != nil {
-		progressCb(1, total)
+		progressCb(0, total)
 	}
 
-	const UidsCount = 32
+	// 一次性批量加载已缓存 UID 集合，替代逐条查询
+	cachedSet, err := getCachedUIDSet(mailfs.remoteDir)
+	if err != nil {
+		return err
+	}
+	logrus.Infof("已缓存 %d 个 UID，开始筛选未缓存…", len(cachedSet))
 
-	uids := make([]imap.UID, 0, UidsCount)
-
-	for i, uid := range allUIDs {
-
-		existed, err := isUIDCached(mailfs.remoteDir, int64(uid))
-		if err != nil {
-			return err
-		}
-
-		if existed {
-			logrus.Debugf("cacheUID : %v has been cached, ignore ...", uid)
+	// 筛选未缓存的 UID
+	var uncachedUIDs []imap.UID
+	for _, uid := range allUIDs {
+		if cachedSet[int64(uid)] {
 			continue
 		}
-
-		uids = append(uids, uid)
-		if len(uids) >= UidsCount || i == (total-1) {
-			err = mailfs.cacheUID(uids)
-			if err != nil {
-				logrus.Errorf("cacheUID failed: %v", err)
-				return err
-			}
-
-			uids = make([]imap.UID, 0, UidsCount)
-
-			if progressCb != nil {
-				progressCb(i, total)
-			}
-		}
+		uncachedUIDs = append(uncachedUIDs, uid)
 	}
 
-	return nil
+	cachedCount := total - len(uncachedUIDs)
+	logrus.Infof("跳过 %d 个已缓存，需处理 %d 个未缓存", cachedCount, len(uncachedUIDs))
+
+	if len(uncachedUIDs) == 0 {
+		if progressCb != nil {
+			progressCb(total, total)
+		}
+		return nil
+	}
+
+	// 分批，每批最多 32 个 UID
+	const batchSize = 32
+	var batches [][]imap.UID
+	for i := 0; i < len(uncachedUIDs); i += batchSize {
+		end := i + batchSize
+		if end > len(uncachedUIDs) {
+			end = len(uncachedUIDs)
+		}
+		batches = append(batches, uncachedUIDs[i:end])
+	}
+
+	// 创建 worker 连接（共 3 个协程：主连接 + 2 个额外连接）
+	const workerCount = 3
+	workers := make([]*MailFileSystem, workerCount)
+	workers[0] = mailfs
+	actualWorkers := 1
+	for i := 1; i < workerCount; i++ {
+		w := &MailFileSystem{cfg: mailfs.cfg}
+		if err := w.Login(mailfs.usr, mailfs.pwd); err != nil {
+			logrus.Warnf("worker %d 登录失败: %v，使用较少并发", i, err)
+			break
+		}
+		if err := w.Enter(mailfs.remoteDir); err != nil {
+			logrus.Warnf("worker %d 进入目录失败: %v，使用较少并发", i, err)
+			w.safeLogout()
+			break
+		}
+		workers[i] = w
+		actualWorkers++
+	}
+	logrus.Infof("缓存同步使用 %d 个并发连接，共 %d 批", actualWorkers, len(batches))
+
+	// 确保额外 worker 连接被清理
+	defer func() {
+		for i := 1; i < actualWorkers; i++ {
+			if workers[i] != nil {
+				workers[i].safeLogout()
+			}
+		}
+	}()
+
+	// 分发批次到 channel
+	batchCh := make(chan []imap.UID, len(batches))
+	for _, batch := range batches {
+		batchCh <- batch
+	}
+	close(batchCh)
+
+	// 多协程并发处理
+	var (
+		processed int64
+		mu        sync.Mutex
+		firstErr  error
+		wg        sync.WaitGroup
+	)
+
+	for i := 0; i < actualWorkers; i++ {
+		wg.Add(1)
+		go func(w *MailFileSystem) {
+			defer wg.Done()
+			for batch := range batchCh {
+				// 检查是否有其他 worker 已失败
+				mu.Lock()
+				failed := firstErr != nil
+				mu.Unlock()
+				if failed {
+					return
+				}
+
+				if err := w.cacheUID(batch); err != nil {
+					logrus.Errorf("cacheUID failed: %v", err)
+					mu.Lock()
+					if firstErr == nil {
+						firstErr = err
+					}
+					mu.Unlock()
+					return
+				}
+
+				n := atomic.AddInt64(&processed, int64(len(batch)))
+				if progressCb != nil {
+					progressCb(cachedCount+int(n), total)
+				}
+			}
+		}(workers[i])
+	}
+
+	wg.Wait()
+
+	return firstErr
 }
 
 func (mailfs *MailFileSystem) Enter(remoteDir string) error {
