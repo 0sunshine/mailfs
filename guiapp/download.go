@@ -38,6 +38,7 @@ type DownloadPage struct {
 	blockBar    *widget.ProgressBar
 	blockLabel  *widget.Label
 	syncBtn     *widget.Button
+	dedupBtn    *widget.Button
 	checkBtn    *widget.Button
 	exportBtn   *widget.Button
 	prevBtn     *widget.Button
@@ -180,6 +181,10 @@ func (p *DownloadPage) Content() fyne.CanvasObject {
 	})
 	p.syncBtn.Importance = widget.HighImportance
 
+	p.dedupBtn = widget.NewButtonWithIcon("去除重复", theme.DeleteIcon(), func() {
+		go p.dedup()
+	})
+
 	p.checkBtn = widget.NewButtonWithIcon("完整性检测", theme.ConfirmIcon(), func() {
 		go p.runIntegrityCheck()
 	})
@@ -214,6 +219,7 @@ func (p *DownloadPage) Content() fyne.CanvasObject {
 
 	toolbar := container.NewHBox(
 		p.syncBtn,
+		p.dedupBtn,
 		p.checkBtn,
 		p.exportBtn,
 		widget.NewSeparator(),
@@ -416,6 +422,125 @@ func (p *DownloadPage) syncCache() {
 	}
 
 	fyne.Do(func() { p.syncBtn.Enable() })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 去除重复
+// ─────────────────────────────────────────────────────────────────────────────
+
+func (p *DownloadPage) dedup() {
+	p.mu.Lock()
+	selFolder := p.selFolder
+	p.mu.Unlock()
+
+	if selFolder == "" {
+		p.setStatus("请先选择文件夹")
+		return
+	}
+
+	if !atomic.CompareAndSwapInt32(&p.fsBusy, 0, 1) {
+		p.setStatus("有操作正在执行，请等待…")
+		return
+	}
+
+	fyne.Do(func() {
+		p.dedupBtn.Disable()
+		p.syncBtn.Disable()
+	})
+
+	// ── 创建模态进度对话框 ──────────────────────────
+	progressBar := widget.NewProgressBar()
+	progressLabel := widget.NewLabel("正在同步缓存…")
+	progressLabel.TextStyle = fyne.TextStyle{Monospace: true}
+	progressLabel.Alignment = fyne.TextAlignCenter
+
+	titleLabel := widget.NewLabelWithStyle(
+		fmt.Sprintf("去除重复 — [%s]", selFolder),
+		fyne.TextAlignLeading,
+		fyne.TextStyle{Bold: true},
+	)
+	line := canvas.NewLine(theme.PrimaryColor())
+	line.StrokeWidth = 1.5
+
+	popContent := container.NewVBox(
+		titleLabel,
+		line,
+		widget.NewSeparator(),
+		progressLabel,
+		progressBar,
+	)
+
+	var pop *widget.PopUp
+	fyne.Do(func() {
+		pop = widget.NewModalPopUp(
+			container.NewPadded(popContent),
+			p.win.Canvas(),
+		)
+		pop.Resize(fyne.NewSize(460, 180))
+		pop.Show()
+	})
+
+	// ── 第一步: 同步缓存 ────────────────────────────
+	err := p.fs.CacheCurrDirWithProgress(func(done, total int) {
+		if total <= 0 {
+			return
+		}
+		v := float64(done) / float64(total)
+		fyne.Do(func() {
+			progressBar.SetValue(v)
+			if done < total {
+				progressLabel.SetText(fmt.Sprintf("同步缓存  %d / %d", done, total))
+			} else {
+				progressLabel.SetText("同步完成，开始查找重复…")
+			}
+		})
+	})
+
+	if err != nil {
+		atomic.StoreInt32(&p.fsBusy, 0)
+		fyne.Do(func() {
+			pop.Hide()
+			p.dedupBtn.Enable()
+			p.syncBtn.Enable()
+		})
+		p.setStatus(fmt.Sprintf("同步缓存失败: %v", err))
+		return
+	}
+
+	// ── 第二步: 执行去重 ────────────────────────────
+	fyne.Do(func() {
+		progressBar.SetValue(0)
+		progressLabel.SetText("正在查找重复邮件…")
+	})
+
+	deleted, err := p.fs.RemoveDuplicates(func(done, total int) {
+		if total <= 0 {
+			return
+		}
+		v := float64(done) / float64(total)
+		fyne.Do(func() {
+			progressBar.SetValue(v)
+			progressLabel.SetText(fmt.Sprintf("删除重复  %d / %d", done, total))
+		})
+	})
+
+	atomic.StoreInt32(&p.fsBusy, 0)
+	fyne.Do(func() {
+		pop.Hide()
+		p.dedupBtn.Enable()
+		p.syncBtn.Enable()
+	})
+
+	if err != nil {
+		p.setStatus(fmt.Sprintf("去重失败: %v (已删除 %d 个)", err, deleted))
+	} else if deleted == 0 {
+		p.setStatus("没有发现重复邮件")
+	} else {
+		p.setStatus(fmt.Sprintf("去重完成，共删除 %d 个重复邮件", deleted))
+	}
+
+	// 刷新文件列表
+	p.selectFolder(selFolder)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
