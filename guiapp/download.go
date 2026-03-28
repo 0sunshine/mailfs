@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
@@ -58,6 +59,9 @@ type DownloadPage struct {
 	treeDirs     map[string]bool     // 是否是目录（有子目录或含文件）
 
 	mu sync.Mutex
+
+	// fsBusy 防止多个 goroutine 同时操作 p.fs（IMAP 连接不可并发）
+	fsBusy int32
 
 	// 最近选中的文件夹名和树节点路径，用于复制
 	lastSelFolder string
@@ -274,6 +278,12 @@ func (p *DownloadPage) Content() fyne.CanvasObject {
 // ─────────────────────────────────────────────────────────────────────────────
 
 func (p *DownloadPage) loadFolders() {
+	if !atomic.CompareAndSwapInt32(&p.fsBusy, 0, 1) {
+		p.setStatus("有操作正在执行，请等待…")
+		return
+	}
+	defer atomic.StoreInt32(&p.fsBusy, 0)
+
 	p.setStatus("正在获取文件夹列表…")
 	folders, err := p.fs.GetMailboxList()
 	if err != nil {
@@ -291,8 +301,17 @@ func (p *DownloadPage) loadFolders() {
 }
 
 func (p *DownloadPage) selectFolder(folder string) {
+	if !atomic.CompareAndSwapInt32(&p.fsBusy, 0, 1) {
+		p.setStatus("有操作正在执行，请等待…")
+		return
+	}
+	defer atomic.StoreInt32(&p.fsBusy, 0)
+
+	p.mu.Lock()
 	p.selFolder = folder
 	p.currentPage = 1
+	p.mu.Unlock()
+
 	p.setStatus(fmt.Sprintf("正在进入 [%s]…", folder))
 
 	if err := p.fs.Enter(folder); err != nil {
@@ -317,13 +336,22 @@ func (p *DownloadPage) selectFolder(folder string) {
 }
 
 func (p *DownloadPage) syncCache() {
-	if p.selFolder == "" {
+	p.mu.Lock()
+	selFolder := p.selFolder
+	p.mu.Unlock()
+
+	if selFolder == "" {
 		p.setStatus("请先选择文件夹")
 		return
 	}
 
+	if !atomic.CompareAndSwapInt32(&p.fsBusy, 0, 1) {
+		p.setStatus("有操作正在执行，请等待…")
+		return
+	}
+
 	fyne.Do(func() { p.syncBtn.Disable() })
-	p.setStatus(fmt.Sprintf("正在同步 [%s]…", p.selFolder))
+	p.setStatus(fmt.Sprintf("正在同步 [%s]…", selFolder))
 
 	// ── 创建模态进度对话框 ──────────────────────────
 	progressBar := widget.NewProgressBar()
@@ -332,7 +360,7 @@ func (p *DownloadPage) syncCache() {
 	progressLabel.Alignment = fyne.TextAlignCenter
 
 	titleLabel := widget.NewLabelWithStyle(
-		fmt.Sprintf("同步缓存 — [%s]", p.selFolder),
+		fmt.Sprintf("同步缓存 — [%s]", selFolder),
 		fyne.TextAlignLeading,
 		fyne.TextStyle{Bold: true},
 	)
@@ -373,7 +401,9 @@ func (p *DownloadPage) syncCache() {
 		})
 	})
 
-	// ── 同步结束，关闭对话框 ────────────────────────
+	// ── 同步结束，释放 busy 并关闭对话框 ─────────────
+	atomic.StoreInt32(&p.fsBusy, 0)
+
 	fyne.Do(func() {
 		pop.Hide()
 	})
@@ -382,7 +412,7 @@ func (p *DownloadPage) syncCache() {
 		p.setStatus(fmt.Sprintf("同步失败: %v", err))
 	} else {
 		p.setStatus("同步完成，正在刷新…")
-		p.selectFolder(p.selFolder)
+		p.selectFolder(selFolder)
 	}
 
 	fyne.Do(func() { p.syncBtn.Enable() })
@@ -616,14 +646,18 @@ func (p *DownloadPage) setStatus(msg string) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 func (p *DownloadPage) runIntegrityCheck() {
-	if p.selFolder == "" {
+	p.mu.Lock()
+	selFolder := p.selFolder
+	p.mu.Unlock()
+
+	if selFolder == "" {
 		p.setStatus("请先选择文件夹")
 		return
 	}
 	fyne.Do(func() { p.checkBtn.Disable() })
-	p.setStatus(fmt.Sprintf("正在检测 [%s] 完整性…", p.selFolder))
+	p.setStatus(fmt.Sprintf("正在检测 [%s] 完整性…", selFolder))
 
-	results, err := libfs.CheckIntegrity(p.selFolder)
+	results, err := libfs.CheckIntegrity(selFolder)
 	if err != nil {
 		p.setStatus(fmt.Sprintf("检测失败: %v", err))
 		fyne.Do(func() { p.checkBtn.Enable() })
@@ -671,12 +705,15 @@ func (p *DownloadPage) runIntegrityCheck() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 func (p *DownloadPage) exportPlaylist() {
-	if p.selFolder == "" {
+	p.mu.Lock()
+	folder := p.selFolder
+	p.mu.Unlock()
+
+	if folder == "" {
 		p.setStatus("请先选择文件夹")
 		return
 	}
 	fyne.Do(func() { p.exportBtn.Disable() })
-	folder := p.selFolder
 	p.setStatus(fmt.Sprintf("正在从数据库查询 [%s] 的文件…", folder))
 
 	// 直接从 SQLite 查询，不依赖 UI 缓存

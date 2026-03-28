@@ -30,6 +30,9 @@ func dbOpen() error {
 		return err
 	}
 
+	// SQLite 不支持并发写，限制为单连接避免 "database is locked" 错误
+	db.SetMaxOpenConns(1)
+
 	if err = db.Ping(); err != nil {
 		logrus.Errorf("sql ping error: %v", err)
 		return err

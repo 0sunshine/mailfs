@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
@@ -44,6 +45,9 @@ type UploadPage struct {
 	selFolder string
 	logs      []string
 	mu        sync.Mutex
+
+	// fsBusy 防止多个 goroutine 同时操作 p.fs（IMAP 连接不可并发）
+	fsBusy int32
 }
 
 func NewUploadPage(fs *libfs.MailFileSystem) *UploadPage {
@@ -64,7 +68,10 @@ func (p *UploadPage) SetWindow(w fyne.Window) {
 
 // handleDrop 处理从系统拖入的文件/文件夹
 func (p *UploadPage) handleDrop(uris []fyne.URI) {
-	if p.selFolder == "" {
+	p.mu.Lock()
+	sel := p.selFolder
+	p.mu.Unlock()
+	if sel == "" {
 		p.setStatus("⚠ 请先在左侧选择目标文件夹，再拖入文件")
 		p.addLog("⚠ 拖拽被忽略：尚未选择目标文件夹")
 		return
@@ -120,13 +127,20 @@ func (p *UploadPage) Content() fyne.CanvasObject {
 			return
 		}
 		folder := p.folders[id]
+		p.mu.Lock()
 		p.selFolder = folder
+		p.mu.Unlock()
 		p.targetLabel.SetText(folder)
 		p.uploadFileBtn.Enable()
 		p.uploadDirBtn.Enable()
-		// 更新拖拽区提示
 		p.dropZone.SetActive(true)
 		go func() {
+			if !atomic.CompareAndSwapInt32(&p.fsBusy, 0, 1) {
+				p.setStatus("有操作正在执行，请等待…")
+				return
+			}
+			defer atomic.StoreInt32(&p.fsBusy, 0)
+
 			if err := p.fs.Enter(folder); err != nil {
 				p.setStatus(fmt.Sprintf("进入文件夹失败: %v", err))
 			} else {
@@ -244,6 +258,12 @@ func (p *UploadPage) Content() fyne.CanvasObject {
 // ─── 文件夹加载 ────────────────────────────────────────────────────────────
 
 func (p *UploadPage) loadFolders() {
+	if !atomic.CompareAndSwapInt32(&p.fsBusy, 0, 1) {
+		p.setStatus("有操作正在执行，请等待…")
+		return
+	}
+	defer atomic.StoreInt32(&p.fsBusy, 0)
+
 	p.setStatus("正在获取文件夹列表…")
 	folders, err := p.fs.GetMailboxList()
 	if err != nil {
@@ -291,6 +311,12 @@ func (p *UploadPage) pickAndUploadDir() {
 // ─── 上传执行（带双层进度）────────────────────────────────────────────────
 
 func (p *UploadPage) doUploadFile(path string) {
+	if !atomic.CompareAndSwapInt32(&p.fsBusy, 0, 1) {
+		p.setStatus("有操作正在执行，请等待…")
+		return
+	}
+	defer atomic.StoreInt32(&p.fsBusy, 0)
+
 	name := filepath.Base(path)
 	p.addLog(fmt.Sprintf("▶ 开始上传: %s", name))
 	p.setStatus(fmt.Sprintf("上传中: %s", name))
@@ -319,6 +345,12 @@ func (p *UploadPage) doUploadFile(path string) {
 }
 
 func (p *UploadPage) doUploadDir(path string) {
+	if !atomic.CompareAndSwapInt32(&p.fsBusy, 0, 1) {
+		p.setStatus("有操作正在执行，请等待…")
+		return
+	}
+	defer atomic.StoreInt32(&p.fsBusy, 0)
+
 	dirName := filepath.Base(path)
 	p.addLog(fmt.Sprintf("▶ 开始上传目录: %s/", dirName))
 	p.setStatus(fmt.Sprintf("上传目录: %s/…", dirName))

@@ -245,6 +245,13 @@ func (s *HTTPIMAPServer) submitDownload(ctx context.Context, imapDir string, uid
 	case s.taskQueue <- task:
 		logrus.Debugf("[Scheduler] 任务入队: %s", key)
 	case <-ctx.Done():
+		// 任务未入队，必须清理 waiter，否则该 key 的 waiter 永远不会被 close
+		s.waiterMu.Lock()
+		if cur, ok := s.waiters[key]; ok && cur == w {
+			close(w.done)
+			delete(s.waiters, key)
+		}
+		s.waiterMu.Unlock()
 		return nil, fmt.Errorf("request cancelled before task enqueued: %w", ctx.Err())
 	}
 
