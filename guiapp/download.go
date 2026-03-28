@@ -450,7 +450,7 @@ func (p *DownloadPage) dedup() {
 
 	// ── 创建模态进度对话框 ──────────────────────────
 	progressBar := widget.NewProgressBar()
-	progressLabel := widget.NewLabel("正在同步缓存…")
+	progressLabel := widget.NewLabel("正在获取邮件列表…")
 	progressLabel.TextStyle = fyne.TextStyle{Monospace: true}
 	progressLabel.Alignment = fyne.TextAlignCenter
 
@@ -480,39 +480,7 @@ func (p *DownloadPage) dedup() {
 		pop.Show()
 	})
 
-	// ── 第一步: 同步缓存 ────────────────────────────
-	err := p.fs.CacheCurrDirWithProgress(func(done, total int) {
-		if total <= 0 {
-			return
-		}
-		v := float64(done) / float64(total)
-		fyne.Do(func() {
-			progressBar.SetValue(v)
-			if done < total {
-				progressLabel.SetText(fmt.Sprintf("同步缓存  %d / %d", done, total))
-			} else {
-				progressLabel.SetText("同步完成，开始查找重复…")
-			}
-		})
-	})
-
-	if err != nil {
-		atomic.StoreInt32(&p.fsBusy, 0)
-		fyne.Do(func() {
-			pop.Hide()
-			p.dedupBtn.Enable()
-			p.syncBtn.Enable()
-		})
-		p.setStatus(fmt.Sprintf("同步缓存失败: %v", err))
-		return
-	}
-
-	// ── 第二步: 执行去重 ────────────────────────────
-	fyne.Do(func() {
-		progressBar.SetValue(0)
-		progressLabel.SetText("正在查找重复邮件…")
-	})
-
+	// ── 执行去重 ────────────────────────────────────
 	deleted, err := p.fs.RemoveDuplicates(func(done, total int) {
 		if total <= 0 {
 			return
@@ -520,7 +488,7 @@ func (p *DownloadPage) dedup() {
 		v := float64(done) / float64(total)
 		fyne.Do(func() {
 			progressBar.SetValue(v)
-			progressLabel.SetText(fmt.Sprintf("删除重复  %d / %d", done, total))
+			progressLabel.SetText(fmt.Sprintf("检查重复  %d / %d", done, total))
 		})
 	})
 
