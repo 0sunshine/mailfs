@@ -287,6 +287,9 @@ func (mailfs *MailFileSystem) UploadFileEach(header *mail.Header, text []byte, f
 		appendCmd := mailfs.c.Append(mailfs.remoteDir, int64(len(mailData)), nil)
 		if _, err := appendCmd.Write(mailData); err != nil {
 			logrus.Errorf("failed to write message: %v", err)
+			// 必须调用 Close() 以释放命令队列槽位（enc.end()），
+			// 否则后续 APPEND 命令会永久阻塞在队列里。
+			_ = appendCmd.Close()
 			return err
 		}
 		if err := appendCmd.Close(); err != nil {

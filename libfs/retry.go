@@ -58,6 +58,10 @@ func isNetworkError(err error) bool {
 		"write: connection reset",
 		"read: connection reset",
 		"server closed",
+		// QQ 邮箱服务端限流/临时繁忙 → 断线重连后重试
+		"system busy",
+		"too many connections",
+		"login too frequent",
 	}
 	for _, kw := range keywords {
 		if strings.Contains(msg, kw) {
